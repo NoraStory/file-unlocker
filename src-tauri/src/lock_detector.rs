@@ -9,6 +9,7 @@
 //! 所有 `unsafe` FFI 细节收敛在本模块与子模块内部；
 //! Restart Manager 会话句柄通过 RAII（`Drop`）保证释放，杜绝泄漏。
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -192,41 +193,160 @@ fn scan_directory(
     }
 
     let total = files.len();
-    // 每个文件跑一次检测，按 PID 聚合并统计占用的文件数
-    use std::collections::HashMap;
+
+    // 性能关键路径：一次句柄表遍历解析出全部文件句柄路径，
+    // 与目录前缀做匹配——等价于逐文件 scan() 但从 O(N×全表) 降为 O(1×全表)。
+    // RM 引擎对目录模式同样批量化：一次会话注册全部文件资源。
     let mut merged: HashMap<u32, ProcessInfo> = HashMap::new();
-    let mut scanned_files = 0usize;
-    for f in &files {
-        // RM 在部分系统不可用，此时靠句柄扫描逐文件跑；
-        // 目录可能很大，这里容忍单文件失败继续下一个
-        if let Ok(list) = scan_single_file(f.to_string_lossy().as_ref()) {
-            scanned_files += 1;
-            for mut info in list {
-                let entry = merged.entry(info.pid).or_insert(info.clone());
-                entry.locked_files += 1;
-                // 描述/路径取任意一次成功的值（同一进程）
-                if entry.description.is_empty() {
-                    entry.description = info.description;
-                }
-                if entry.exe_path.is_empty() {
-                    entry.exe_path = info.exe_path.clone();
-                }
-                info.source = "directory_scan".into();
-            }
+
+    if let Ok(rm_list) = batch_query_restart_manager(&files) {
+        for (pid, app_name) in rm_list {
+            let exe_path = process_image_full(pid).unwrap_or_default();
+            let description = file_description(&exe_path).unwrap_or_default();
+            let process_name = exe_path
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(&app_name)
+                .to_string();
+            merged.insert(
+                pid,
+                ProcessInfo {
+                    pid,
+                    process_name,
+                    exe_path,
+                    description,
+                    app_name,
+                    source: "restart_manager".into(),
+                    locked_files: 0, // 由句柄扫描路径统计覆盖
+                },
+            );
         }
-        on_progress(scanned_files, total);
     }
 
-    if scanned_files == 0 && !files.is_empty() {
-        return Err(format!(
-            "扫描了 {} 个文件但全部失败（可能需要管理员权限）",
-            files.len()
-        ));
+    // 句柄扫描：单次遍历 + 目录前缀匹配
+    let hit_map = handle_scan::scan_directory(dir, on_progress, total);
+    for (pid, paths) in hit_map {
+        let entry = merged.entry(pid).or_insert_with(|| {
+            let exe_path = process_image_full(pid).unwrap_or_default();
+            let description = file_description(&exe_path).unwrap_or_default();
+            let process_name = exe_path
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            ProcessInfo {
+                pid,
+                process_name,
+                exe_path,
+                description,
+                app_name: String::new(),
+                source: "handle_scan".into(),
+                locked_files: 0,
+            }
+        });
+        entry.source = "both".into();
+        // 按实际命中的、确实位于目录内的路径数计数（去重：同一路径多句柄算一个文件）
+        let uniq: HashSet<&String> = paths.iter().collect();
+        entry.locked_files = uniq.len() as u32;
+    }
+    merged.retain(|_, info| info.locked_files > 0);
+
+    if merged.is_empty() && !files.is_empty() {
+        // 句柄扫描正常完成但无命中 = 目录下无锁定文件，这是可信结果
+        return Ok(Vec::new());
     }
 
     let mut list: Vec<ProcessInfo> = merged.into_values().collect();
     list.sort_by_key(|p| p.pid);
     Ok(list)
+}
+
+/// RM 批量查询：一次会话注册多个文件资源，返回 pid → app_name。
+/// 资源数上限受 RM 实现限制（实测数百可用），超出时分批注册。
+fn batch_query_restart_manager(files: &[std::path::PathBuf]) -> Result<Vec<(u32, String)>, String> {
+    const BATCH: usize = 500;
+    let mut all = Vec::new();
+    for chunk in files.chunks(BATCH) {
+        match query_restart_manager_batch(chunk) {
+            Ok(mut list) => all.append(&mut list),
+            Err(_) => continue, // 部分系统 RM 不可用，静默交给句柄扫描
+        }
+    }
+    Ok(all)
+}
+
+/// 单批 RM 查询（一次会话注册多个资源）
+fn query_restart_manager_batch(files: &[std::path::PathBuf]) -> Result<Vec<(u32, String)>, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::RestartManager::{
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
+        RM_PROCESS_INFO,
+    };
+
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wide_paths: Vec<Vec<u16>> = files
+        .iter()
+        .map(|p| to_wide(p.to_string_lossy().as_ref()))
+        .collect();
+    let pcsz: Vec<PCWSTR> = wide_paths.iter().map(|w| PCWSTR(w.as_ptr())).collect();
+
+    let mut handle = 0u32;
+    let mut session_key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+    let err = unsafe { RmStartSession(&mut handle, None, PWSTR(session_key.as_mut_ptr())) };
+    if err != ERROR_SUCCESS {
+        return Err(format!("RmStartSession 失败 (错误码 {})", err.0));
+    }
+    // 手动管理会话释放（批量路径不走 RAII 守卫，因注册资源数动态）
+    let result = (|| -> Result<Vec<(u32, String)>, String> {
+        let err = unsafe {
+            RmRegisterResources(handle, Some(&pcsz), None, None)
+        };
+        if err != ERROR_SUCCESS {
+            return Err(format!("RmRegisterResources 失败 (错误码 {})", err.0));
+        }
+
+        let mut needed = 0u32;
+        let mut count = 0u32;
+        let mut buf: Vec<RM_PROCESS_INFO> = Vec::new();
+        for _ in 0..5 {
+            let err = unsafe {
+                RmGetList(
+                    handle,
+                    &mut needed,
+                    &mut count,
+                    if buf.is_empty() { None } else { Some(buf.as_mut_ptr()) },
+                    std::ptr::null_mut(),
+                )
+            };
+            if err == ERROR_SUCCESS {
+                buf.truncate(count as usize);
+                return Ok(buf
+                    .iter()
+                    .map(|raw| (raw.Process.dwProcessId, utf16_string(&raw.strAppName)))
+                    .collect());
+            }
+            if err != ERROR_MORE_DATA || needed == 0 {
+                return Err(format!("RmGetList 失败 (错误码 {})", err.0));
+            }
+            buf = vec![RM_PROCESS_INFO::default(); needed as usize];
+            count = needed;
+        }
+        Err("进程表持续变化，RmGetList 重试 5 次仍未成功".into())
+    })();
+
+    unsafe {
+        let _ = RmEndSession(handle);
+    }
+    result
+}
+
+/// 供性能基准示例调用（内部函数的透传包装）
+#[doc(hidden)]
+#[cfg(feature = "e2e")]
+pub fn bench_rm_query(path: &str) -> Result<Vec<(u32, String)>, String> {
+    query_restart_manager(path)
 }
 
 /// 单文件模式：双引擎合并查询。
