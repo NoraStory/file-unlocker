@@ -101,18 +101,20 @@ fn check_restart_manager() -> DiagItem {
         RM_PROCESS_INFO,
     };
 
-    // 建临时文件做探针（先创建再独占打开，模拟真实占用）
+    // 探针文件：create(true) 一步创建并独占打开，失败带完整 OS 错误入日志
     let probe = std::env::temp_dir().join(format!("fu_diag_{}.tmp", std::process::id()));
-    if std::fs::write(&probe, b"diag").is_err() {
-        return warn("Restart Manager", "探针文件创建失败，跳过");
-    }
-    let _file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
         .write(true)
         .share_mode(0) // 独占，模拟真实占用
         .open(&probe);
-    let Ok(_file) = _file else {
+    let Ok(_file) = file else {
+        let e = file.unwrap_err();
+        log::warn!("[自检] Restart Manager 探针文件创建失败: {e}");
         let _ = std::fs::remove_file(&probe);
-        return warn("Restart Manager", "探针文件独占打开失败，跳过");
+        return warn("Restart Manager", format!("探针文件创建失败：{e}"));
     };
     let wide = crate::winutil::to_wide(&probe.to_string_lossy());
 
@@ -155,17 +157,18 @@ fn check_restart_manager() -> DiagItem {
 fn check_handle_scan() -> DiagItem {
     use std::os::windows::fs::OpenOptionsExt;
     let probe = std::env::temp_dir().join(format!("fu_diag_scan_{}.tmp", std::process::id()));
-    if std::fs::write(&probe, b"diag").is_err() {
-        return fail("句柄扫描引擎", "探针文件创建失败");
-    }
     let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .share_mode(0)
         .open(&probe);
     let Ok(file) = file else {
+        let e = file.unwrap_err();
+        log::warn!("[自检] 句柄扫描探针文件创建失败: {e}");
         let _ = std::fs::remove_file(&probe);
-        return fail("句柄扫描引擎", "探针文件独占打开失败");
+        return fail("句柄扫描引擎", format!("探针文件创建失败：{e}"));
     };
 
     let pids = crate::handle_scan::scan(&probe);

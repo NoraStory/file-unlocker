@@ -1,6 +1,6 @@
 [package]
 name = "file-unlocker"
-version = "0.3.0"
+version = "0.3.1"
 description = "检测并解除 Windows 文件占用"
 edition = "2021"
 rust-version = "1.77"
@@ -23,6 +23,7 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_RestartManager",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

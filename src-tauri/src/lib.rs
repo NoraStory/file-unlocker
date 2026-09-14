@@ -104,6 +104,90 @@ fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// 日志目录路径
+#[tauri::command]
+fn get_log_dir(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri::Manager;
+    app.path()
+        .app_log_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| format!("获取日志目录失败：{e}"))
+}
+
+/// 打开日志目录（资源管理器）
+#[tauri::command]
+fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("获取日志目录失败：{e}"))?;
+    log::info!("[日志] 打开日志目录: {}", dir.display());
+
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide = crate::winutil::to_wide(&dir.to_string_lossy());
+    let op = crate::winutil::to_wide("open"); // 先绑定变量，避免临时值悬垂
+    let result = unsafe {
+        ShellExecuteW(None, PCWSTR(op.as_ptr()), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL)
+    };
+    if (result.0 as isize) <= 32 {
+        return Err(format!("打开日志目录失败（错误码 {}）", result.0 as isize));
+    }
+    Ok(())
+}
+
+/// 导出日志：把日志目录全部文件复制到用户选择的目录下
+#[tauri::command]
+fn export_logs(app: tauri::AppHandle, dest_dir: String) -> Result<String, String> {
+    use tauri::Manager;
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("获取日志目录失败：{e}"))?;
+    let dest = std::path::Path::new(&dest_dir);
+    if !dest.is_dir() {
+        return Err("导出目标不是目录".into());
+    }
+
+    let stamp = chrono_lite_stamp();
+    let out_dir = dest.join(format!("FileUnlocker-logs-{stamp}"));
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建导出目录失败：{e}"))?;
+
+    let mut copied = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&log_dir) {
+        for entry in entries.flatten() {
+            let from = entry.path();
+            if !from.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let to = out_dir.join(&name);
+            if std::fs::copy(&from, &to).is_ok() {
+                copied += 1;
+            }
+        }
+    }
+    if copied == 0 {
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return Err("日志目录中没有可导出的文件（程序可能刚启动尚无日志）".into());
+    }
+    log::info!("[日志] 已导出 {copied} 个日志文件到 {}", out_dir.display());
+    Ok(format!("已导出 {copied} 个日志文件到：{}", out_dir.display()))
+}
+
+/// 可读时间戳（本地时间 YYYYMMDD-HHMMSS）
+fn chrono_lite_stamp() -> String {
+    use windows::Win32::Foundation::SYSTEMTIME;
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let st: SYSTEMTIME = unsafe { GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
+}
+
 /// 自检：检测权限、检测引擎、右键菜单、日志等必要前提
 #[tauri::command]
 async fn run_diagnostics() -> Vec<diagnostics::DiagItem> {
@@ -182,6 +266,9 @@ pub fn run() {
             delete_file_on_reboot,
             take_pending_file,
             app_version,
+            get_log_dir,
+            open_log_dir,
+            export_logs,
             run_diagnostics,
             check_update,
             download_update

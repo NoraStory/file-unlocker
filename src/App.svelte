@@ -13,12 +13,16 @@
     takePendingFile,
     pickFile,
     runDiagnostics,
+    getLogDir,
+    openLogDir,
+    exportLogs,
     checkUpdate,
     downloadUpdate,
     toErrorMessage,
     type DiagItem,
     type UpdateInfo,
   } from "./lib/api";
+  import { open as pickDirectory } from "@tauri-apps/plugin-dialog";
   import type { ProcessInfo } from "./lib/types";
 
   let filePath = $state<string | null>(null);
@@ -159,10 +163,44 @@
     diagOpen = true;
     diagRunning = true;
     diagItems = [];
+    refreshLogDir();
     try {
       diagItems = await runDiagnostics();
     } finally {
       diagRunning = false;
+    }
+  }
+
+  /** 日志目录路径（诊断面板展示） */
+  let logDirPath = $state("");
+  let logNotice = $state<string | null>(null);
+
+  async function refreshLogDir() {
+    logDirPath = await getLogDir();
+  }
+
+  /** 导出日志：选目录 → 后端复制日志文件 */
+  async function doExportLogs() {
+    logNotice = null;
+    try {
+      const dir = await pickDirectory({
+        directory: true,
+        multiple: false,
+        title: "选择日志导出位置",
+      });
+      if (typeof dir !== "string" || !dir) return;
+      logNotice = await exportLogs(dir);
+    } catch (e) {
+      logNotice = `导出失败：${toErrorMessage(e)}`;
+    }
+  }
+
+  async function doOpenLogDir() {
+    logNotice = null;
+    try {
+      await openLogDir();
+    } catch (e) {
+      logNotice = `打开日志目录失败：${toErrorMessage(e)}`;
     }
   }
 
@@ -370,6 +408,26 @@
             {/each}
           </ul>
         {/if}
+      </div>
+      <div class="flex flex-col gap-1.5 border-t px-4 py-2.5" style="border-color: var(--stroke);">
+        {#if logDirPath}
+          <div class="dim truncate text-[11px]" title={logDirPath}>日志目录：{logDirPath}</div>
+        {/if}
+        {#if logNotice}
+          <div class="break-all text-[11px]" style="color: var(--ok);">{logNotice}</div>
+        {/if}
+        <div class="flex items-center gap-2">
+          <button
+            class="flex-1 rounded-md px-2 py-1.5 text-xs transition hover:opacity-80 active:scale-95"
+            style="background: var(--stroke);"
+            onclick={doOpenLogDir}
+          >打开日志目录</button>
+          <button
+            class="flex-1 rounded-md px-2 py-1.5 text-xs transition hover:opacity-80 active:scale-95"
+            style="background: var(--stroke);"
+            onclick={doExportLogs}
+          >导出日志…</button>
+        </div>
       </div>
     </div>
   {/if}

@@ -143,6 +143,33 @@ export async function runDiagnostics(): Promise<DiagItem[]> {
   }
 }
 
+/** 日志目录路径 */
+export async function getLogDir(): Promise<string> {
+  try {
+    return await invoke<string>("get_log_dir");
+  } catch {
+    return "";
+  }
+}
+
+/** 打开日志目录 */
+export async function openLogDir(): Promise<void> {
+  try {
+    await invoke<void>("open_log_dir");
+  } catch (e) {
+    throw new Error(toErrorMessage(e));
+  }
+}
+
+/** 导出日志到指定目录 */
+export async function exportLogs(destDir: string): Promise<string> {
+  try {
+    return await invoke<string>("export_logs", { destDir });
+  } catch (e) {
+    throw new Error(toErrorMessage(e));
+  }
+}
+
 /** 检查更新（GitHub → Gitee） */
 export async function checkUpdate(): Promise<UpdateInfo | null> {
   try {
