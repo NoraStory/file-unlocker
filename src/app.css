@@ -1,0 +1,141 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light dark;
+
+  /* Win11 质感语义变量 */
+  --bg: #eef1f7;
+  --glass: rgba(255, 255, 255, 0.55);
+  --glass-strong: rgba(255, 255, 255, 0.78);
+  --stroke: rgba(0, 0, 0, 0.08);
+  --stroke-strong: rgba(0, 0, 0, 0.14);
+  --text: #1b1b1f;
+  --text-dim: #63636e;
+  --accent: #0067c0;
+  --accent-soft: rgba(0, 103, 192, 0.12);
+  --danger: #d13438;
+  --ok: #0f9d58;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1e26;
+    --glass: rgba(40, 40, 46, 0.55);
+    --glass-strong: rgba(32, 32, 36, 0.8);
+    --stroke: rgba(255, 255, 255, 0.09);
+    --stroke-strong: rgba(255, 255, 255, 0.16);
+    --text: #f3f3f6;
+    --text-dim: #a6a6b0;
+    --accent: #4cc2ff;
+    --accent-soft: rgba(76, 194, 255, 0.14);
+    --danger: #ff6b6d;
+    --ok: #6ccb5f;
+  }
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  /* 窗口底色：由 CSS 提供（浅/深随系统），卡片用半透明玻璃质感叠加 */
+  background: linear-gradient(160deg, var(--bg) 0%, color-mix(in srgb, var(--bg) 82%, var(--accent) 18%) 100%);
+  color: var(--text);
+  font-family: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI",
+    "PingFang SC", system-ui, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.glass {
+  background: var(--glass);
+  border: 1px solid var(--stroke);
+  backdrop-filter: blur(28px) saturate(1.5);
+  -webkit-backdrop-filter: blur(28px) saturate(1.5);
+  border-radius: 12px;
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+.accent-btn {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  transition: filter 0.15s ease, transform 0.1s ease;
+}
+.accent-btn:hover {
+  filter: brightness(1.08);
+}
+.accent-btn:active {
+  transform: scale(0.97);
+}
+
+.danger-btn {
+  background: var(--danger);
+  color: #fff;
+  border-radius: 8px;
+  transition: filter 0.15s ease, transform 0.1s ease;
+}
+.danger-btn:hover {
+  filter: brightness(1.1);
+}
+.danger-btn:active {
+  transform: scale(0.96);
+}
+
+.dropzone {
+  border: 1.5px dashed var(--stroke-strong);
+  border-radius: 12px;
+  background: var(--glass);
+  transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+}
+.dropzone:hover {
+  border-color: var(--accent);
+  background: var(--glass-strong);
+}
+.dropzone.dragging {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  transform: scale(1.01);
+}
+
+.card {
+  background: var(--glass);
+  border: 1px solid var(--stroke);
+  backdrop-filter: blur(28px) saturate(1.5);
+  -webkit-backdrop-filter: blur(28px) saturate(1.5);
+  border-radius: 12px;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.pulse-ok {
+  animation: pulse-ok 1.2s ease;
+}
+@keyframes pulse-ok {
+  0% {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.12);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+  }
+}
