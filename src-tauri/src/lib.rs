@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use lock_detector::ProcessInfo;
+use lock_detector::ScanOutcome;
 use tauri::{Emitter, Manager, State};
 
 mod diagnostics;
@@ -15,6 +15,10 @@ mod winutil;
 /// 存在的意义：单实例回调或提权启动时，主窗口可能尚未创建，
 /// 直接 emit 事件会丢失，所以先落地到 state，由前端挂载后主动取走。
 struct PendingFile(Mutex<Option<String>>);
+
+/// 启动静默检查发现的更新信息，同样落地等前端取走——
+/// WebView 未加载完成时 emit 的 "update-available" 事件会丢失。
+struct PendingUpdate(Mutex<Option<updater::UpdateInfo>>);
 
 /// 从命令行参数中找出第一个真实存在的文件/目录路径
 fn extract_path_from_args(args: &[String]) -> Option<String> {
@@ -41,7 +45,7 @@ fn push_file(app: &tauri::AppHandle, path: String) {
 async fn get_locking_processes(
     window: tauri::Window<tauri::Wry>,
     file_path: String,
-) -> Result<Vec<ProcessInfo>, String> {
+) -> Result<ScanOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         // 目录模式可能扫描数千文件、耗时数秒，向前端发进度事件；
         // 节流：按已完成的 2% 或每 20 个发一次
@@ -77,24 +81,41 @@ async fn kill_process_tree(pid: u32) -> Result<(), String> {
 
 /// 立即删除文件（delete=true 双重确认，防止误触；路径/系统目录校验在后端执行）
 #[tauri::command]
-fn delete_file(file_path: String, delete: bool) -> Result<(), String> {
+async fn delete_file(file_path: String, delete: bool) -> Result<(), String> {
     if !delete {
         return Err("缺少确认参数".into());
     }
-    file_actions::delete_file(&file_path)
+    // 删除大文件或网络盘文件可能耗时，遵守"重活一律 spawn_blocking"的约定
+    tauri::async_runtime::spawn_blocking(move || file_actions::delete_file(&file_path))
+        .await
+        .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
 /// 计划下次重启时删除文件（delete=true 双重确认，防止误触）
 #[tauri::command]
-fn delete_file_on_reboot(file_path: String, delete: bool) -> Result<(), String> {
+async fn delete_file_on_reboot(file_path: String, delete: bool) -> Result<(), String> {
     if !delete {
         return Err("缺少确认参数".into());
     }
-    file_actions::delete_on_reboot(&file_path)
+    tauri::async_runtime::spawn_blocking(move || file_actions::delete_on_reboot(&file_path))
+        .await
+        .map_err(|e| format!("后台任务异常：{e}"))?
+}
+
+/// 判断目标是否为目录（前端据此切换"目录模式"UI，隐藏文件删除按钮）
+#[tauri::command]
+fn is_directory(path: String) -> bool {
+    std::path::Path::new(&path).is_dir()
 }
 
 #[tauri::command]
 fn take_pending_file(state: State<'_, PendingFile>) -> Option<String> {
+    state.0.lock().unwrap().take()
+}
+
+/// 取走启动静默检查发现的更新信息（一次性；与 take_pending_file 同理）
+#[tauri::command]
+fn take_pending_update(state: State<'_, PendingUpdate>) -> Option<updater::UpdateInfo> {
     state.0.lock().unwrap().take()
 }
 
@@ -140,13 +161,20 @@ fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
 
 /// 导出日志：把日志目录全部文件复制到用户选择的目录下
 #[tauri::command]
-fn export_logs(app: tauri::AppHandle, dest_dir: String) -> Result<String, String> {
+async fn export_logs(app: tauri::AppHandle, dest_dir: String) -> Result<String, String> {
+    // 日志可能多达 10×1MB，文件复制移出 UI 线程
+    tauri::async_runtime::spawn_blocking(move || export_logs_impl(&app, &dest_dir))
+        .await
+        .map_err(|e| format!("后台任务异常：{e}"))?
+}
+
+fn export_logs_impl(app: &tauri::AppHandle, dest_dir: &str) -> Result<String, String> {
     use tauri::Manager;
     let log_dir = app
         .path()
         .app_log_dir()
         .map_err(|e| format!("获取日志目录失败：{e}"))?;
-    let dest = std::path::Path::new(&dest_dir);
+    let dest = std::path::Path::new(dest_dir);
     if !dest.is_dir() {
         return Err("导出目标不是目录".into());
     }
@@ -258,13 +286,16 @@ pub fn run() {
             }
         }))
         .manage(PendingFile(Mutex::new(None)))
+        .manage(PendingUpdate(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_locking_processes,
             kill_process,
             kill_process_tree,
             delete_file,
             delete_file_on_reboot,
+            is_directory,
             take_pending_file,
+            take_pending_update,
             app_version,
             get_log_dir,
             open_log_dir,
@@ -289,12 +320,26 @@ pub fn run() {
                     .unwrap()
                     .replace(path);
             }
-            // 启动后静默检查更新（非阻塞）
+            // 启动后静默检查更新（非阻塞；HTTP 是阻塞调用，须进 spawn_blocking，
+            // 直接放在 async task 里会占住运行时的工作线程）
             let handle = app.handle().clone();
             let current = app.package_info().version.to_string();
             tauri::async_runtime::spawn(async move {
-                if let Some(info) = updater::check_for_update(&current) {
+                let info = tauri::async_runtime::spawn_blocking(move || {
+                    updater::check_for_update(&current)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(info) = info {
                     log::info!("[更新] 发现新版本 {}", info.version);
+                    // 先落地再 emit：窗口未就绪时事件会丢，前端挂载后主动取走
+                    handle
+                        .state::<PendingUpdate>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .replace(info.clone());
                     let _ = handle.emit("update-available", info);
                 }
             });

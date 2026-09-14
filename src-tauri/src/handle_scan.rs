@@ -7,7 +7,8 @@ use std::path::Path;
 
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, STATUS_INFO_LENGTH_MISMATCH,
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+    STATUS_INFO_LENGTH_MISMATCH,
 };
 use windows::Win32::Storage::FileSystem::{
     GetFinalPathNameByHandleW, GetFileType, FILE_NAME_NORMALIZED, FILE_TYPE_DISK,
@@ -148,7 +149,8 @@ pub fn bench_scan(path: &std::path::Path) -> Vec<u32> {
 /// 明确区分——上层不得把失效伪装成"文件未被占用"。
 pub fn scan(path: &Path) -> Result<Vec<u32>, String> {
     let target = normalize_path(path);
-    let map = collect_handle_paths_if(&|resolved: &str| resolved.to_lowercase() == target)?;
+    let map =
+        collect_handle_paths_if(&|resolved: &str| resolved.to_lowercase() == target, None)?;
     Ok(map.into_keys().collect())
 }
 
@@ -157,30 +159,20 @@ pub fn scan(path: &Path) -> Result<Vec<u32>, String> {
 ///
 /// 精度与逐文件 scan() 完全一致——同一次遍历解析出的完整路径做前缀匹配；
 /// 只是把 N 次全表遍历合并为 1 次，N 个文件从 O(N×全表) 降为 O(1×全表)。
+/// `on_progress` 按"已解析候选句柄数 / 候选总数"上报：与文件清单无对应
+/// 关系，但单调递增、粒度均匀，进度条走势平滑。
 pub fn scan_directory(
     dir: &Path,
     on_progress: &(dyn Fn(usize, usize) + Sync),
-    total_hint: usize,
 ) -> Result<std::collections::HashMap<u32, Vec<String>>, String> {
     let mut prefix = normalize_path(dir);
     if !prefix.ends_with('\\') {
         prefix.push('\\');
     }
-    // 进度语义：句柄表遍历顺序与文件清单无关，用命中数近似上报并钳在
-    // total_hint 内，结束时推满，保证进度条走完
-    let reported = std::sync::atomic::AtomicUsize::new(0);
-    let result = collect_handle_paths_if(&|resolved: &str| {
-        let hit = resolved.to_lowercase().starts_with(&prefix);
-        if hit {
-            let r = reported.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if r % 20 == 0 {
-                on_progress(r.min(total_hint), total_hint);
-            }
-        }
-        hit
-    })?;
-    on_progress(total_hint, total_hint);
-    Ok(result)
+    collect_handle_paths_if(
+        &|resolved: &str| resolved.to_lowercase().starts_with(&prefix),
+        Some(on_progress),
+    )
 }
 
 /// 归一化：小写、去掉 `\\?\` 前缀
@@ -201,6 +193,7 @@ unsafe impl Sync for SendHandle {}
 
 /// 一次全系统句柄表遍历：解析每个 File 句柄的 DOS 路径（去掉 `\\?\`），
 /// 对 `hit` 返回 true 的路径按 pid 收集。
+/// `progress` 非空时按"已处理候选数 / 候选总数"周期性上报。
 ///
 /// 性能设计（精度不变的前提下提速）：
 /// 1. 两阶段快照查询，只分配恰好大小的缓冲（省 64MB memset）
@@ -211,6 +204,7 @@ unsafe impl Sync for SendHandle {}
 ///    系统调用是主要开销，CPU 核越多收益越大
 fn collect_handle_paths_if(
     hit: &(dyn Fn(&str) -> bool + Sync),
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> Result<std::collections::HashMap<u32, Vec<String>>, String> {
     enable_debug_privilege();
 
@@ -243,6 +237,7 @@ fn collect_handle_paths_if(
         }
         candidates.push((pid, entry.handle, entry.granted_access));
     }
+    let total_candidates = candidates.len();
 
     // 并行解析：进程句柄按 pid 缓存（Mutex），null 表示该 pid 打不开
     let results: std::sync::Mutex<std::collections::HashMap<u32, Vec<String>>> = Default::default();
@@ -264,6 +259,12 @@ fn collect_handle_paths_if(
                     if idx >= candidates.len() {
                         break;
                     }
+                    if let Some(cb) = progress {
+                        // 每 256 个候选上报一次，频率足以让进度条平滑又不刷屏
+                        if idx % 256 == 0 {
+                            cb(idx, total_candidates);
+                        }
+                    }
                     let (pid, handle, _granted) = candidates[idx];
 
                     let proc = {
@@ -271,8 +272,11 @@ fn collect_handle_paths_if(
                         cache
                             .entry(pid)
                             .or_insert_with(|| SendHandle(
+                                // 失败缓存必须用 INVALID_HANDLE_VALUE(-1) 作哨兵：
+                                // HANDLE::default() 是 null，is_invalid() 识别不了，
+                                // 会导致"已失败"的 pid 被当成可用来回复制
                                 unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
-                                    .unwrap_or(HANDLE::default()),
+                                    .unwrap_or(INVALID_HANDLE_VALUE),
                             ))
                             .0
                     };
@@ -328,6 +332,10 @@ fn collect_handle_paths_if(
             });
         }
     });
+
+    if let Some(cb) = progress {
+        cb(total_candidates, total_candidates); // 收尾推满，保证进度条走完
+    }
 
     // 释放缓存的进程句柄
     for SendHandle(proc) in proc_cache.into_inner().unwrap().into_values() {

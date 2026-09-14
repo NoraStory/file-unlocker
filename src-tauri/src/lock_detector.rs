@@ -43,10 +43,32 @@ pub struct ProcessInfo {
     pub description: String,
     /// Restart Manager 报告的应用显示名（可能为空）
     pub app_name: String,
-    /// 检测来源：Restart Manager / 句柄扫描 / 两者皆有 / directory_scan
+    /// 检测来源：restart_manager / handle_scan / both
     pub source: String,
     /// 目录模式下该进程锁定的文件数量（单文件模式恒为 1）
     pub locked_files: u32,
+}
+
+/// 从 exe 完整路径提取进程名；exe 路径为空时回退到 fallback（如 RM 的 app_name）。
+/// 注意："".rsplit().next() 是 Some("") 而非 None，必须显式过滤空串。
+fn process_name_of(exe_path: &str, fallback: &str) -> String {
+    exe_path
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// 扫描结果：占用进程列表 + 目录模式的元信息
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanOutcome {
+    /// 占用进程列表（按 PID 排序）
+    pub processes: Vec<ProcessInfo>,
+    /// 目录模式下枚举文件数达到上限，结果被截断（前端应给出提示）
+    pub truncated: bool,
+    /// 目录模式实际枚举的文件数（截断时等于上限；单文件模式恒为 1）
+    pub file_count: usize,
 }
 
 /// RAII 守卫：无论中途如何退出（包括 `?` 早退），都保证 `RmEndSession` 被调用。
@@ -145,7 +167,7 @@ fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> 
 pub fn get_locking_processes(
     file_path: &str,
     on_progress: &(dyn Fn(usize, usize) + Sync),
-) -> Result<Vec<ProcessInfo>, String> {
+) -> Result<ScanOutcome, String> {
     let started = std::time::Instant::now();
     log::info!("[检测] 目标: {file_path}");
     // 输入校验：前端传来的路径必须真实存在，避免下游错误难排查
@@ -161,12 +183,21 @@ pub fn get_locking_processes(
     let result = if path.is_dir() {
         scan_directory(path, on_progress)
     } else {
-        scan_single_file(file_path)
+        scan_single_file(file_path).map(|processes| ScanOutcome {
+            processes,
+            truncated: false,
+            file_count: 1,
+        })
     };
     match &result {
-        Ok(list) => log::info!(
-            "[检测] 完成: {} 个占用进程，耗时 {:?}",
-            list.len(),
+        Ok(outcome) => log::info!(
+            "[检测] 完成: {} 个占用进程{}，耗时 {:?}",
+            outcome.processes.len(),
+            if outcome.truncated {
+                "（目录文件数超上限，结果已截断）"
+            } else {
+                ""
+            },
             started.elapsed()
         ),
         Err(e) => log::warn!("[检测] 失败: {e}，耗时 {:?}", started.elapsed()),
@@ -181,7 +212,7 @@ pub fn get_locking_processes(
 fn scan_directory(
     dir: &Path,
     on_progress: &(dyn Fn(usize, usize) + Sync),
-) -> Result<Vec<ProcessInfo>, String> {
+) -> Result<ScanOutcome, String> {
     const MAX_FILES: usize = 2000;
 
     let mut files = Vec::new();
@@ -204,6 +235,7 @@ fn scan_directory(
     }
 
     let total = files.len();
+    let truncated = total >= MAX_FILES;
 
     // 性能关键路径：一次句柄表遍历解析出全部文件句柄路径，
     // 与目录前缀做匹配——等价于逐文件 scan() 但从 O(N×全表) 降为 O(1×全表)。
@@ -214,11 +246,7 @@ fn scan_directory(
         for (pid, app_name) in rm_list {
             let exe_path = process_image_full(pid).unwrap_or_default();
             let description = file_description(&exe_path).unwrap_or_default();
-            let process_name = exe_path
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(&app_name)
-                .to_string();
+            let process_name = process_name_of(&exe_path, &app_name);
             merged.insert(
                 pid,
                 ProcessInfo {
@@ -228,14 +256,15 @@ fn scan_directory(
                     description,
                     app_name,
                     source: "restart_manager".into(),
-                    locked_files: 0, // 由句柄扫描路径统计覆盖
+                    // RM 不提供逐文件计数；至少记 1，防止 RM 独有的检出被误丢弃
+                    locked_files: 1,
                 },
             );
         }
     }
 
     // 句柄扫描：单次遍历 + 目录前缀匹配；引擎失效时不得伪装成"无占用"
-    let hit_map = match handle_scan::scan_directory(dir, on_progress, total) {
+    let hit_map = match handle_scan::scan_directory(dir, on_progress) {
         Ok(m) => m,
         Err(e) => {
             log::error!("[检测] 句柄扫描引擎失效: {e}");
@@ -245,43 +274,58 @@ fn scan_directory(
             }
             let mut list: Vec<ProcessInfo> = merged.into_values().collect();
             list.sort_by_key(|p| p.pid);
-            return Ok(list);
+            return Ok(ScanOutcome {
+                processes: list,
+                truncated,
+                file_count: total,
+            });
         }
     };
     for (pid, paths) in hit_map {
-        let entry = merged.entry(pid).or_insert_with(|| {
-            let exe_path = process_image_full(pid).unwrap_or_default();
-            let description = file_description(&exe_path).unwrap_or_default();
-            let process_name = exe_path
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            ProcessInfo {
-                pid,
-                process_name,
-                exe_path,
-                description,
-                app_name: String::new(),
-                source: "handle_scan".into(),
-                locked_files: 0,
-            }
-        });
-        entry.source = "both".into();
         // 按实际命中的、确实位于目录内的路径数计数（去重：同一路径多句柄算一个文件）
         let uniq: HashSet<&String> = paths.iter().collect();
-        entry.locked_files = uniq.len() as u32;
+        let count = uniq.len() as u32;
+        match merged.entry(pid) {
+            // RM 也报了该 PID：标记双引擎命中，文件数以句柄扫描的精确计数为准
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let info = e.get_mut();
+                info.source = "both".into();
+                info.locked_files = count;
+            }
+            // 仅句柄扫描发现（RM 不可用或漏报）
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let exe_path = process_image_full(pid).unwrap_or_default();
+                let description = file_description(&exe_path).unwrap_or_default();
+                let process_name = process_name_of(&exe_path, "");
+                e.insert(ProcessInfo {
+                    pid,
+                    process_name,
+                    exe_path,
+                    description,
+                    app_name: String::new(),
+                    source: "handle_scan".into(),
+                    locked_files: count,
+                });
+            }
+        }
     }
-    merged.retain(|_, info| info.locked_files > 0);
 
     if merged.is_empty() && !files.is_empty() {
         // 句柄扫描正常完成但无命中 = 目录下无锁定文件，这是可信结果
-        return Ok(Vec::new());
+        return Ok(ScanOutcome {
+            processes: Vec::new(),
+            truncated,
+            file_count: total,
+        });
     }
 
     let mut list: Vec<ProcessInfo> = merged.into_values().collect();
     list.sort_by_key(|p| p.pid);
-    Ok(list)
+    Ok(ScanOutcome {
+        processes: list,
+        truncated,
+        file_count: total,
+    })
 }
 
 /// RM 批量查询：一次会话注册多个文件资源，返回 pid → app_name。
@@ -389,11 +433,7 @@ fn scan_single_file(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
     for (pid, app_name) in rm_list {
         let exe_path = process_image_full(pid).unwrap_or_default();
         let description = file_description(&exe_path).unwrap_or_default();
-        let process_name = exe_path
-            .rsplit(['\\', '/'])
-            .next()
-            .unwrap_or(&app_name)
-            .to_string();
+        let process_name = process_name_of(&exe_path, &app_name);
         merged.insert(
             pid,
             ProcessInfo {
@@ -418,11 +458,7 @@ fn scan_single_file(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
             std::collections::hash_map::Entry::Vacant(e) => {
                 let exe_path = process_image_full(pid).unwrap_or_default();
                 let description = file_description(&exe_path).unwrap_or_default();
-                let process_name = exe_path
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
+                let process_name = process_name_of(&exe_path, "");
                 e.insert(ProcessInfo {
                     pid,
                     process_name,
@@ -631,6 +667,9 @@ fn descendants_still_alive(ancestor_pid: u32) -> Option<Vec<u32>> {
 /// 递归收集指定 pid 的全部后代后逐个 TerminateProcess。
 pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     log::info!("[结束进程树] 根 pid={pid}");
+    if pid == 0 || pid == 4 {
+        return Err(format!("无效的进程树根 PID：{pid}"));
+    }
     let parents = build_parent_map()?;
 
     // BFS 收集后代（含自身）；过滤会造成自伤的目标
@@ -660,7 +699,13 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
         .into_iter()
         .filter(|&p| {
             if let Some(exe) = process_image_full(p) {
-                let name = exe.to_lowercase();
+                // exe 是完整路径（如 C:\Windows\explorer.exe），必须取文件名再比较，
+                // 否则该防护永远命中不了
+                let name = exe
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
                 if name == "explorer.exe" {
                     explorer_killed = true;
                     return false; // 跳过 shell 进程

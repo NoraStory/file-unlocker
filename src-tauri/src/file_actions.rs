@@ -30,16 +30,36 @@ fn validate_path(path: &str, must_exist: bool) -> Result<(), String> {
 /// 判断路径是否为系统关键位置——这些位置禁止删除，防止误操作损坏系统。
 /// 只覆盖操作系统与全局程序目录；用户目录（C:\Users\...）是本工具的
 /// 主战场，不在保护之列。
+///
+/// 比较前必须先归一化：`C:/Windows/...`（正斜杠）与 `\\?\C:\Windows`
+/// （NT 前缀）都能逃过朴素的文本前缀匹配，但 DeleteFileW 都接受。
 fn is_protected_location(path: &str) -> bool {
-    const PROTECTED: [&str; 3] = [
-        "c:\\windows",
-        "c:\\program files",
-        "c:\\program files (x86)",
+    let mut lower = path.trim().to_lowercase().replace('/', "\\");
+    for prefix in [r"\\?\", r"\\.\"] {
+        if let Some(stripped) = lower.strip_prefix(prefix) {
+            lower = stripped.to_string();
+        }
+    }
+    let lower = lower.trim_end_matches('\\');
+
+    let mut protected: Vec<String> = vec![
+        "c:\\windows".into(),
+        "c:\\program files".into(),
+        "c:\\program files (x86)".into(),
     ];
-    let lower = path.to_lowercase();
-    PROTECTED.iter().any(|dir| {
-        lower == *dir || lower.starts_with(&format!("{dir}\\"))
-    })
+    // 系统不一定装在 C 盘：以环境变量报告的真实目录为准
+    for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim().to_lowercase().replace('/', "\\");
+            let v = v.trim_end_matches('\\');
+            if !v.is_empty() {
+                protected.push(v.to_string());
+            }
+        }
+    }
+    protected
+        .iter()
+        .any(|dir| lower == dir || lower.starts_with(&format!("{dir}\\")))
 }
 
 /// 立即删除文件。占用未释放或权限不足时返回可读错误。
@@ -101,6 +121,9 @@ mod tests {
     fn rejects_protected_locations() {
         assert!(delete_file("C:\\Windows\\System32\\kernel32.dll").is_err());
         assert!(delete_on_reboot("c:\\Program Files\\x\\y.dll").is_err());
+        // 正斜杠与 \\?\ 前缀形式不得绕过系统目录保护
+        assert!(delete_on_reboot("C:/Windows/System32/x.dll").is_err());
+        assert!(delete_on_reboot("\\\\?\\C:\\Windows\\x.dll").is_err());
         // 保护规则的错误应是"受保护"而非"不存在"——注意 must_exist 校验
         // 先行，因此用确实存在的系统文件断言错误类型
         let err = delete_file("C:\\Windows\\explorer.exe").unwrap_err();

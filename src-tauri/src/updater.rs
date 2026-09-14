@@ -57,14 +57,18 @@ fn parse_version(v: &str) -> Vec<u64> {
         .collect()
 }
 
-/// candidate 是否比 current 新（忽略 current 为空的开发场景）
+/// candidate 是否比 current 新（忽略 current 为空的开发场景）。
+/// 段数不一致时短的一侧补 0："1.0" 与 "1.0.0" 相等，"0.3.1" 新于 "0.3"。
 pub fn is_newer(candidate: &str, current: &str) -> bool {
-    let c = parse_version(candidate);
-    let v = parse_version(current);
+    let mut c = parse_version(candidate);
+    let mut v = parse_version(current);
     if v.is_empty() {
         return !c.is_empty();
     }
-    c.len() == v.len() && c > v
+    let n = c.len().max(v.len());
+    c.resize(n, 0);
+    v.resize(n, 0);
+    c > v
 }
 
 /// 依次尝试各更新源拉取清单，返回比当前版本新的更新信息
@@ -124,7 +128,16 @@ pub fn download_asset(
 ) -> Result<std::path::PathBuf, String> {
     let dir = std::env::temp_dir().join("FileUnlockerUpdate");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败：{e}"))?;
-    let dest = dir.join(&asset.name);
+    // 资产名必须是纯文件名：清单内容来自网络，带路径分隔符或 ".." 的名字
+    // 会把下载内容写到临时目录之外（路径穿越）
+    let name = std::path::Path::new(&asset.name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if name.is_empty() || name != asset.name {
+        return Err(format!("非法的资产文件名：{}", asset.name));
+    }
+    let dest = dir.join(name);
 
     log::info!("[更新] 下载 {} ← {}", asset.name, asset.url);
     let agent = ureq::AgentBuilder::new()
@@ -225,6 +238,10 @@ mod tests {
         assert!(!is_newer("0.2.1", "0.2.1"));
         assert!(!is_newer("0.2.0", "0.2.1"));
         assert!(!is_newer("0.2.1", "0.3.0"));
+        // 段数不一致：短侧补 0 再比
+        assert!(is_newer("0.3.1", "0.3"));
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(!is_newer("0.3", "0.3.1"));
     }
 
     #[test]

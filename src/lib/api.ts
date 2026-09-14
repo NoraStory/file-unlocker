@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ProcessInfo } from "./types";
+import type { ScanOutcome } from "./types";
 
 /**
  * 统一错误提取：Tauri invoke 失败时 reject 的值可能是 Error、string 或
@@ -25,20 +25,20 @@ function validatePath(filePath: string): string | null {
   return null;
 }
 
-/** 查询占用指定文件的进程列表 */
+/** 查询占用指定文件的进程列表（含目录模式的截断信息） */
 export async function getLockingProcesses(
   filePath: string,
-): Promise<ProcessInfo[]> {
+): Promise<ScanOutcome> {
   const invalid = validatePath(filePath);
   if (invalid) throw new Error(invalid);
   try {
-    const list = await invoke<ProcessInfo[]>("get_locking_processes", {
+    const outcome = await invoke<ScanOutcome>("get_locking_processes", {
       filePath,
     });
-    if (!Array.isArray(list)) {
+    if (!outcome || !Array.isArray(outcome.processes)) {
       throw new Error("后端返回数据格式异常");
     }
-    return list;
+    return outcome;
   } catch (e) {
     throw new Error(toErrorMessage(e));
   }
@@ -87,6 +87,15 @@ export async function deleteFileOnReboot(filePath: string): Promise<void> {
     await invoke<void>("delete_file_on_reboot", { filePath, delete: true });
   } catch (e) {
     throw new Error(toErrorMessage(e));
+  }
+}
+
+/** 判断路径是否为目录（目录路径通常不带尾部分隔符，前端无法靠字符串判断） */
+export async function pathIsDirectory(path: string): Promise<boolean> {
+  try {
+    return await invoke<boolean>("is_directory", { path });
+  } catch {
+    return false;
   }
 }
 
@@ -167,6 +176,15 @@ export async function exportLogs(destDir: string): Promise<string> {
     return await invoke<string>("export_logs", { destDir });
   } catch (e) {
     throw new Error(toErrorMessage(e));
+  }
+}
+
+/** 取走启动静默检查发现的更新信息（一次性；防 WebView 未就绪时事件丢失） */
+export async function takePendingUpdate(): Promise<UpdateInfo | null> {
+  try {
+    return await invoke<UpdateInfo | null>("take_pending_update");
+  } catch {
+    return null;
   }
 }
 

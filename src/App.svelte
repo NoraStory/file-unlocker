@@ -11,6 +11,8 @@
     deleteFile,
     deleteFileOnReboot,
     takePendingFile,
+    takePendingUpdate,
+    pathIsDirectory,
     pickFile,
     runDiagnostics,
     getLogDir,
@@ -36,6 +38,12 @@
   let fileNotice = $state<string | null>(null);
   /** 当前目标是文件夹（右键菜单支持文件夹入口） */
   let isDirectory = $state(false);
+  /** 目录扫描达到文件数上限被截断 */
+  let scanTruncated = $state(false);
+  /** 目录模式实际枚举的文件数 */
+  let scanFileCount = $state(0);
+  /** 删除确认条展开中（替代原生 confirm，风格统一且不会被误触跳过） */
+  let confirmingDelete = $state(false);
 
   /** 自检面板 */
   let diagOpen = $state(false);
@@ -69,16 +77,23 @@
   async function scan(path: string) {
     const gen = ++scanGeneration;
     filePath = path;
-    // 文件夹入口：句柄扫描可查目录占用，但删除/重启删除语义不同
-    isDirectory = path.endsWith("\\") || path.endsWith("/");
     error = null;
     fileNotice = null;
     scanProgress = null;
+    scanTruncated = false;
+    confirmingDelete = false;
     scanning = true;
+    // 右键菜单/拖拽传入的目录路径不带尾部分隔符，必须问后端真实文件类型；
+    // 判定错了会对文件夹显示"删除文件"按钮（删除必失败）
+    const dir = await pathIsDirectory(path);
+    if (gen !== scanGeneration) return; // 已被更新的扫描取代
+    isDirectory = dir;
     try {
-      const list = await getLockingProcesses(path);
+      const outcome = await getLockingProcesses(path);
       if (gen !== scanGeneration) return; // 已被更新的扫描取代
-      processes = list;
+      processes = outcome.processes;
+      scanTruncated = outcome.truncated;
+      scanFileCount = outcome.file_count;
       scanned = true;
     } catch (e) {
       if (gen !== scanGeneration) return;
@@ -98,6 +113,7 @@
     if (busy || !filePath) return;
     killingPid = pid;
     error = null;
+    const gen = scanGeneration;
     try {
       if (tree) {
         await killProcessTree(pid);
@@ -109,7 +125,13 @@
       error = toErrorMessage(e);
       // 失败后仍刷新一次：进程可能实际已退出（如权限拒绝但进程崩溃）
       try {
-        await getLockingProcesses(filePath).then((p) => (processes = p));
+        const outcome = await getLockingProcesses(filePath);
+        // 期间若用户发起了新扫描，刷新结果不得覆盖新扫描
+        if (gen === scanGeneration) {
+          processes = outcome.processes;
+          scanTruncated = outcome.truncated;
+          scanFileCount = outcome.file_count;
+        }
       } catch {
         /* 刷新失败保持原列表 */
       }
@@ -129,7 +151,8 @@
         fileNotice = "已计划：下次系统重启时删除该文件";
       } else {
         await deleteFile(filePath);
-        fileNotice = "文件已删除";
+        // 删除成功后清空目标（clearFile 会一并清掉提示区，
+        // 因此这里不再设置"已删除"提示——设置了也立即被清掉）
         clearFile();
       }
     } catch (e) {
@@ -145,6 +168,8 @@
     scanned = false;
     error = null;
     fileNotice = null;
+    scanTruncated = false;
+    confirmingDelete = false;
   }
 
   async function chooseFile() {
@@ -307,6 +332,13 @@
       // 启动参数中带路径（右键菜单首次启动）时立即检测
       const pending = await takePendingFile();
       if (pending && !filePath) scan(pending);
+
+      // 启动静默检查的 emit 可能早于 WebView 就绪而丢失，取落地副本兜底
+      const pendingUpdate = await takePendingUpdate();
+      if (pendingUpdate) {
+        updateInfo = pendingUpdate;
+        updateOpen = true;
+      }
     })();
 
     return () => {
@@ -551,6 +583,9 @@
             style="background: {processes.length > 0 ? 'var(--danger)' : 'var(--ok)'}33; color: {processes.length > 0 ? 'var(--danger)' : 'var(--ok)'};"
           >{processes.length} 个</span>
         {/if}
+        {#if scanned && !scanning && scanTruncated}
+          <span class="dim text-[11px]">目录文件过多，仅检测前 {scanFileCount} 个</span>
+        {/if}
       </div>
       {#if filePath}
         <button
@@ -588,7 +623,7 @@
                 ></div>
               </div>
               <div class="dim mt-1.5 text-center text-xs">
-                目录模式：{scanProgress.done} / {scanProgress.total} 个文件
+                目录模式：已解析 {scanProgress.done} / {scanProgress.total} 个候选句柄
               </div>
             </div>
           {:else}
@@ -689,14 +724,40 @@
         <div class="card px-4 py-2.5 text-xs" in:fade={{ duration: 150 }}>
           📁 文件夹模式：已递归检测内部文件的占用者，删除操作请针对具体文件
         </div>
+      {:else if confirmingDelete}
+        <!-- 删除确认条：替代原生 confirm()，风格统一且需二次点击，防误触 -->
+        <div
+          class="card flex items-center gap-2 px-4 py-2.5"
+          in:fade={{ duration: 120 }}
+          style="border-color: var(--danger);"
+        >
+          <span class="min-w-0 flex-1 text-xs" style="color: var(--danger);">
+            确认永久删除「{fileName}」？此操作不可恢复
+          </span>
+          <button
+            class="danger-btn shrink-0 px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+            disabled={busy}
+            onclick={() => {
+              confirmingDelete = false;
+              doDelete(false);
+            }}
+          >
+            {#if fileActionBusy === "delete"}正在删除…{:else}确认删除{/if}
+          </button>
+          <button
+            class="shrink-0 rounded-md px-2.5 py-1.5 text-xs transition hover:opacity-80 active:scale-95"
+            style="background: var(--stroke);"
+            onclick={() => (confirmingDelete = false)}
+          >取消</button>
+        </div>
       {:else}
       <div class="flex items-center gap-2">
         <button
           class="danger-btn flex-1 px-3 py-2.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
           disabled={busy}
-          onclick={() => confirm(`确定永久删除文件？\n${filePath}`) && doDelete(false)}
+          onclick={() => (confirmingDelete = true)}
         >
-          {#if fileActionBusy === "delete"}正在删除…{:else}删除文件{/if}
+          删除文件
         </button>
         <button
           class="flex-1 rounded-lg px-3 py-2.5 text-sm font-medium transition hover:opacity-80 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"

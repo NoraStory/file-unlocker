@@ -9,8 +9,18 @@ export interface ProcessInfo {
   description: string;
   /** Restart Manager 报告的应用显示名（可能为空） */
   app_name: string;
-  /** 检测来源：restart_manager / handle_scan / both / directory_scan */
+  /** 检测来源：restart_manager / handle_scan / both */
   source: string;
   /** 目录模式下该进程锁定的文件数量（单文件模式恒为 1） */
   locked_files: number;
+}
+
+/** 后端 `ScanOutcome` 结构体的前端镜像 */
+export interface ScanOutcome {
+  /** 占用进程列表 */
+  processes: ProcessInfo[];
+  /** 目录模式下枚举文件数达到上限，结果被截断 */
+  truncated: boolean;
+  /** 目录模式实际枚举的文件数（截断时等于上限；单文件模式恒为 1） */
+  file_count: number;
 }

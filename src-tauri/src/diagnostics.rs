@@ -122,31 +122,33 @@ fn check_restart_manager() -> DiagItem {
         let mut handle = 0u32;
         let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
         if RmStartSession(&mut handle, None, PWSTR(key.as_mut_ptr())) != ERROR_SUCCESS {
-            return fail("Restart Manager", "RmStartSession 失败：服务不可用");
-        }
-        let outcome = if RmRegisterResources(
-            handle,
-            Some(&[PCWSTR(wide.as_ptr())]),
-            None,
-            None,
-        ) != ERROR_SUCCESS
-        {
-            fail("Restart Manager", "RmRegisterResources 失败")
+            // 不提前 return：否则下面的探针文件清理不会执行，临时目录残留垃圾
+            fail("Restart Manager", "RmStartSession 失败：服务不可用")
         } else {
-            let mut needed = 0u32;
-            let mut count = 16u32;
-            let mut buf = vec![RM_PROCESS_INFO::default(); count as usize];
-            match RmGetList(handle, &mut needed, &mut count, Some(buf.as_mut_ptr()), std::ptr::null_mut()) {
-                ERROR_SUCCESS => ok("Restart Manager", format!("正常（检出 {count} 个占用进程）")),
-                ERROR_MORE_DATA => ok("Restart Manager", "正常（占用数超过探测缓冲）"),
-                err => warn(
-                    "Restart Manager",
-                    format!("查询异常（错误码 {}），本机 RM 服务受限；句柄扫描引擎独立兜底，不影响使用", err.0),
-                ),
-            }
-        };
-        let _ = RmEndSession(handle);
-        outcome
+            let outcome = if RmRegisterResources(
+                handle,
+                Some(&[PCWSTR(wide.as_ptr())]),
+                None,
+                None,
+            ) != ERROR_SUCCESS
+            {
+                fail("Restart Manager", "RmRegisterResources 失败")
+            } else {
+                let mut needed = 0u32;
+                let mut count = 16u32;
+                let mut buf = vec![RM_PROCESS_INFO::default(); count as usize];
+                match RmGetList(handle, &mut needed, &mut count, Some(buf.as_mut_ptr()), std::ptr::null_mut()) {
+                    ERROR_SUCCESS => ok("Restart Manager", format!("正常（检出 {count} 个占用进程）")),
+                    ERROR_MORE_DATA => ok("Restart Manager", "正常（占用数超过探测缓冲）"),
+                    err => warn(
+                        "Restart Manager",
+                        format!("查询异常（错误码 {}），本机 RM 服务受限；句柄扫描引擎独立兜底，不影响使用", err.0),
+                    ),
+                }
+            };
+            let _ = RmEndSession(handle);
+            outcome
+        }
     };
     drop(_file);
     let _ = std::fs::remove_file(&probe);
