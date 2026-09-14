@@ -1,16 +1,18 @@
 @echo off
-chcp 65001 >nul
-:: å¸è½½ FileUnlocker å³é”®èœå•ï¼ˆéœ€ç®¡ç†å‘˜æƒé™ï¼‰
+rem ============================================
+rem FileUnlocker ÓÒ¼ü²Ëµ¥Ð¶ÔØ½Å±¾
+rem ÓÃ·¨£ºÖ±½ÓË«»÷ÔËÐÐ£¨ÎÞ¹ÜÀíÔ±È¨ÏÞÊ±»á×Ô¶¯µ¯³ö UAC ÌáÈ¨£©
+rem ============================================
 
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [!] è¯·å³é”®é€‰æ‹©"ä»¥ç®¡ç†å‘˜èº«ä»½è¿è¡Œ"æœ¬è„šæœ¬
-    pause
-    exit /b 1
+    echo [*] ÕýÔÚÇëÇó¹ÜÀíÔ±È¨ÏÞ£¬ÇëÔÚ UAC µ¯´°ÖÐµã»÷"ÊÇ"...
+    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
 )
 
 reg delete "HKEY_CLASSES_ROOT\*\shell\FileUnlocker" /f >nul 2>&1
 reg delete "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker" /f >nul 2>&1
 
-echo [âˆš] å·²å¸è½½å³é”®èœå•
+echo [Íê³É] ÒÑÐ¶ÔØÓÒ¼ü²Ëµ¥
 pause

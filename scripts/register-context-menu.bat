@@ -1,42 +1,49 @@
 @echo off
-chcp 65001 >nul
-:: ============================================
-:: FileUnlocker å³é”®èœå•æ³¨å†Œè„šæœ¬ï¼ˆéœ€ç®¡ç†å‘˜æƒé™ï¼‰
-:: ç”¨æ³•ï¼šå³é”®"ä»¥ç®¡ç†å‘˜èº«ä»½è¿è¡Œ"ï¼Œæˆ–å°† exe æ‹–åˆ°æœ¬è„šæœ¬ä¸Š
-:: ============================================
+rem ============================================
+rem FileUnlocker ÓÒ¼ü²Ëµ¥×¢²á½Å±¾
+rem ÓÃ·¨£ºÖ±½ÓË«»÷ÔËÐÐ£¨ÎÞ¹ÜÀíÔ±È¨ÏÞÊ±»á×Ô¶¯µ¯³ö UAC ÌáÈ¨£©£¬
+rem       »ò°Ñ FileUnlocker.exe ÍÏµ½±¾½Å±¾ÉÏ×¢²áÈÎÒâÎ»ÖÃµÄ³ÌÐò
+rem ============================================
 
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [!] è¯·å³é”®é€‰æ‹©"ä»¥ç®¡ç†å‘˜èº«ä»½è¿è¡Œ"æœ¬è„šæœ¬
-    pause
-    exit /b 1
+    echo [*] ÕýÔÚÇëÇó¹ÜÀíÔ±È¨ÏÞ£¬ÇëÔÚ UAC µ¯´°ÖÐµã»÷"ÊÇ"...
+    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
 )
 
 set "EXE=%~1"
-if "%EXE%"=="" set "EXE=%~dp0..\src-tauri\target\release\FileUnlocker.exe"
-if not exist "%EXE%" (
-    echo [!] æ‰¾ä¸åˆ°ç¨‹åºï¼š%EXE%
-    echo     å¯å°† FileUnlocker.exe æ‹–åˆ°æœ¬è„šæœ¬ä¸Šé‡æ–°è¿è¡Œ
+if "%EXE%"=="" (
+    rem Ä¬ÈÏÕÒ cargo ²úÎï»ò NSIS °²×°ºóµÄ³ÌÐòÃû
+    if exist "%~dp0..\src-tauri\target\release\file-unlocker.exe" (
+        set "EXE=%~dp0..\src-tauri\target\release\file-unlocker.exe"
+    ) else if exist "%~dp0..\src-tauri\target\release\FileUnlocker.exe" (
+        set "EXE=%~dp0..\src-tauri\target\release\FileUnlocker.exe"
+    )
+)
+if "%EXE%"=="" (
+    echo [!] Î´ÕÒµ½³ÌÐò£¬ÇëÏÈÖ´ÐÐ npm run tauri build
+    echo     »ò°Ñ FileUnlocker.exe ÍÏµ½±¾½Å±¾ÉÏÖØÐÂÔËÐÐ
     pause
     exit /b 1
 )
 
-echo [*] æ­£åœ¨æ³¨å†Œå³é”®èœå•ï¼ˆç¨‹åºè·¯å¾„ï¼š%EXE%ï¼‰
-set "EXE_Q=%EXE:"=%"
+echo [*] ÕýÔÚ×¢²áÓÒ¼ü²Ëµ¥£¨³ÌÐòÂ·¾¶£º%EXE%£©
 
-:: æ–‡ä»¶å³é”®èœå•ï¼ˆä»»æ„æ–‡ä»¶ï¼‰
-reg add "HKEY_CLASSES_ROOT\*\shell\FileUnlocker" /ve /d "è§£é™¤æ–‡ä»¶å ç”¨" /f >nul
-reg add "HKEY_CLASSES_ROOT\*\shell\FileUnlocker" /v "Icon" /d "%EXE_Q%" /f >nul
+rem ---- ÈÎÒâÎÄ¼þµÄÓÒ¼ü²Ëµ¥ ----
+reg add "HKEY_CLASSES_ROOT\*\shell\FileUnlocker" /ve /d "½â³ýÎÄ¼þÕ¼ÓÃ" /f >nul
+reg add "HKEY_CLASSES_ROOT\*\shell\FileUnlocker" /v "Icon" /d "%EXE%" /f >nul
 reg add "HKEY_CLASSES_ROOT\*\shell\FileUnlocker" /v "Position" /d "Top" /f >nul
-reg add "HKEY_CLASSES_ROOT\*\shell\FileUnlocker\command" /ve /d "\"%EXE_Q%\" \"%%1\"" /f >nul
+reg add "HKEY_CLASSES_ROOT\*\shell\FileUnlocker\command" /ve /d "\"%EXE%\" \"%%1\"" /f >nul
 
-:: æ–‡ä»¶å¤¹å³é”®èœå•
-reg add "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker" /ve /d "è§£é™¤æ–‡ä»¶å¤¹å ç”¨" /f >nul
-reg add "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker" /v "Icon" /d "%EXE_Q%" /f >nul
+rem ---- ÎÄ¼þ¼ÐµÄÓÒ¼ü²Ëµ¥ ----
+reg add "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker" /ve /d "½â³ýÎÄ¼þ¼ÐÕ¼ÓÃ" /f >nul
+reg add "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker" /v "Icon" /d "%EXE%" /f >nul
 reg add "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker" /v "Position" /d "Top" /f >nul
-reg add "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker\command" /ve /d "\"%EXE_Q%\" \"%%1\"" /f >nul
+reg add "HKEY_CLASSES_ROOT\Directory\shell\FileUnlocker\command" /ve /d "\"%EXE%\" \"%%1\"" /f >nul
 
-echo [âˆš] æ³¨å†Œå®Œæˆï¼åœ¨ä»»æ„æ–‡ä»¶/æ–‡ä»¶å¤¹ä¸Šå³é”®å³å¯çœ‹åˆ°"è§£é™¤æ–‡ä»¶å ç”¨"
-echo     æ³¨æ„ï¼šWindows 11 è‹¥æœªæ˜¾ç¤ºï¼Œå¯èƒ½éœ€åœ¨"è®¾ç½®-ç³»ç»Ÿ-å¼€å‘è€…é€‰é¡¹"æˆ–
-echo     æ³¨å†Œè¡¨ä¸­æ£€æŸ¥æ˜¯å¦è¢« Win11 æ–°å¼èœå•æ”¶çº³ï¼ˆå¯æŒ‰ä½ Shift å³é”®æŸ¥çœ‹æ—§å¼èœå•ï¼‰
+echo.
+echo [Íê³É] ×¢²á³É¹¦£¡ÔÚÈÎÒâÎÄ¼þ/ÎÄ¼þ¼ÐÉÏÓÒ¼ü¼´¿É¿´µ½"½â³ýÎÄ¼þÕ¼ÓÃ"
+echo ÌáÊ¾£ºWindows 11 ÐÂÊ½²Ëµ¥¿ÉÄÜ½«ÆäÊÕÄÉ£¬Ðèµã»÷"ÏÔÊ¾¸ü¶àÑ¡Ïî"»ò°´×¡ Shift ÓÒ¼ü
+echo.
 pause
