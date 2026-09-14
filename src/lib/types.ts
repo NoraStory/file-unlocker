@@ -9,6 +9,8 @@ export interface ProcessInfo {
   description: string;
   /** Restart Manager 报告的应用显示名（可能为空） */
   app_name: string;
-  /** 检测来源：restart_manager / handle_scan / both */
+  /** 检测来源：restart_manager / handle_scan / both / directory_scan */
   source: string;
+  /** 目录模式下该进程锁定的文件数量（单文件模式恒为 1） */
+  locked_files: number;
 }

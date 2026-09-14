@@ -326,7 +326,10 @@
                     {p.app_name} ·
                   {/if}
                   PID {p.pid}
-                  {#if p.source !== "restart_manager"}
+                  {#if p.locked_files > 1}
+                    · 占用 {p.locked_files} 个文件
+                  {/if}
+                  {#if p.source === "handle_scan"}
                     · 句柄扫描
                   {/if}
                 </div>
@@ -372,7 +375,7 @@
       {/if}
       {#if isDirectory}
         <div class="card px-4 py-2.5 text-xs" in:fade={{ duration: 150 }}>
-          📁 文件夹模式：仅查询占用进程，删除操作不适用于文件夹
+          📁 文件夹模式：已递归检测内部文件的占用者，删除操作请针对具体文件
         </div>
       {:else}
       <div class="flex items-center gap-2">

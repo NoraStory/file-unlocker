@@ -42,8 +42,10 @@ pub struct ProcessInfo {
     pub description: String,
     /// Restart Manager 报告的应用显示名（可能为空）
     pub app_name: String,
-    /// 检测来源：Restart Manager / 句柄扫描 / 两者皆有
+    /// 检测来源：Restart Manager / 句柄扫描 / 两者皆有 / directory_scan
     pub source: String,
+    /// 目录模式下该进程锁定的文件数量（单文件模式恒为 1）
+    pub locked_files: u32,
 }
 
 /// RAII 守卫：无论中途如何退出（包括 `?` 早退），都保证 `RmEndSession` 被调用。
@@ -134,15 +136,91 @@ fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> 
 }
 
 /// 查询锁定 `file_path` 的所有进程（双引擎合并）。
+///
+/// 目标是文件夹时：递归收集目录内（含子目录）被锁定的文件，
+/// 结果按进程聚合——"谁占了文件夹里的东西"，附带各进程占用的文件数。
 pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
     // 输入校验：前端传来的路径必须真实存在，避免下游错误难排查
     if file_path.is_empty() {
         return Err("文件路径为空".into());
     }
-    if !Path::new(file_path).exists() {
+    let path = Path::new(file_path);
+    if !path.exists() {
         return Err(format!("文件不存在：{file_path}"));
     }
 
+    // 目录模式：枚举内部文件逐个检测后按 PID 聚合
+    if path.is_dir() {
+        return scan_directory(path);
+    }
+
+    scan_single_file(file_path)
+}
+
+/// 文件夹模式：递归枚举目录内文件，检测每个文件的占用者并按 PID 聚合。
+///
+/// 句柄扫描对"查询目录本身"无效（锁的是内部文件，路径不等），
+/// 所以必须展开到文件粒度。为控制耗时限制最大扫描文件数。
+fn scan_directory(dir: &Path) -> Result<Vec<ProcessInfo>, String> {
+    const MAX_FILES: usize = 2000;
+
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue; // 无权限的子目录跳过
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if files.len() < MAX_FILES {
+                files.push(p);
+            }
+        }
+        if files.len() >= MAX_FILES {
+            break;
+        }
+    }
+
+    // 每个文件跑一次检测，按 PID 聚合并统计占用的文件数
+    use std::collections::HashMap;
+    let mut merged: HashMap<u32, ProcessInfo> = HashMap::new();
+    let mut scanned_files = 0usize;
+    for f in &files {
+        // RM 在部分系统不可用，此时靠句柄扫描逐文件跑；
+        // 目录可能很大，这里容忍单文件失败继续下一个
+        if let Ok(list) = scan_single_file(f.to_string_lossy().as_ref()) {
+            scanned_files += 1;
+            for mut info in list {
+                let entry = merged.entry(info.pid).or_insert(info.clone());
+                entry.locked_files += 1;
+                // 描述/路径取任意一次成功的值（同一进程）
+                if entry.description.is_empty() {
+                    entry.description = info.description;
+                }
+                if entry.exe_path.is_empty() {
+                    entry.exe_path = info.exe_path.clone();
+                }
+                info.source = "directory_scan".into();
+            }
+        }
+    }
+
+    if scanned_files == 0 && !files.is_empty() {
+        return Err(format!(
+            "扫描了 {} 个文件但全部失败（可能需要管理员权限）",
+            files.len()
+        ));
+    }
+
+    let mut list: Vec<ProcessInfo> = merged.into_values().collect();
+    list.sort_by_key(|p| p.pid);
+    Ok(list)
+}
+
+/// 单文件模式：双引擎合并查询。
+fn scan_single_file(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
     // 引擎 1：Restart Manager（失败不致命，继续走句柄扫描）
     let rm_result = query_restart_manager(file_path);
     let rm_list = rm_result.clone().unwrap_or_default();
@@ -171,6 +249,7 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
                 description,
                 app_name,
                 source: "restart_manager".into(),
+                locked_files: 1,
             },
         );
     }
@@ -197,6 +276,7 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
                     description,
                     app_name: String::new(),
                     source: "handle_scan".into(),
+                    locked_files: 1,
                 });
             }
         }
