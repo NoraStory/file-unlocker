@@ -32,33 +32,45 @@ fn push_file(app: &tauri::AppHandle, path: String) {
     }
 }
 
+/// 重活类命令一律 async + spawn_blocking：
+/// Tauri 的同步 command 在 WebView2 UI 线程内联执行，耗时超过约 200ms
+/// 就会饿死事件循环，Windows 判定"程序未响应"。
 #[tauri::command]
-fn get_locking_processes(
+async fn get_locking_processes(
     window: tauri::Window<tauri::Wry>,
     file_path: String,
 ) -> Result<Vec<ProcessInfo>, String> {
-    // 目录模式可能扫描数千文件、耗时数秒，向前端发进度事件；
-    // 节流：每个文件都 emit 太频繁，按已完成的 2% 或每 20 个发一次
-    let last = std::sync::atomic::AtomicUsize::new(0);
-    let on_progress = |done: usize, total: usize| {
-        let step = (total / 50).max(1);
-        let now = done / step;
-        if now != last.swap(now, std::sync::atomic::Ordering::Relaxed) || done == total {
-            let _ = window.emit("scan-progress", (done, total));
-        }
-    };
-    lock_detector::get_locking_processes(&file_path, &on_progress)
+    tauri::async_runtime::spawn_blocking(move || {
+        // 目录模式可能扫描数千文件、耗时数秒，向前端发进度事件；
+        // 节流：按已完成的 2% 或每 20 个发一次
+        let last = std::sync::atomic::AtomicUsize::new(0);
+        let on_progress = |done: usize, total: usize| {
+            let step = (total / 50).max(1);
+            let now = done / step;
+            if now != last.swap(now, std::sync::atomic::Ordering::Relaxed) || done == total {
+                let _ = window.emit("scan-progress", (done, total));
+            }
+        };
+        lock_detector::get_locking_processes(&file_path, &on_progress)
+    })
+    .await
+    .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
 #[tauri::command]
-fn kill_process(pid: u32) -> Result<(), String> {
-    lock_detector::kill_process(pid)
+async fn kill_process(pid: u32) -> Result<(), String> {
+    // kill 后要等待最长 3 秒确认退出，必须在后台线程
+    tauri::async_runtime::spawn_blocking(move || lock_detector::kill_process(pid))
+        .await
+        .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
 /// 结束整个进程树（含全部子进程）
 #[tauri::command]
-fn kill_process_tree(pid: u32) -> Result<(), String> {
-    lock_detector::kill_process_tree(pid)
+async fn kill_process_tree(pid: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || lock_detector::kill_process_tree(pid))
+        .await
+        .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
 /// 立即删除文件（delete=true 双重确认，防止误触；路径/系统目录校验在后端执行）
