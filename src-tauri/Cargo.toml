@@ -1,6 +1,6 @@
 [package]
 name = "file-unlocker"
-version = "0.1.2"
+version = "0.1.3"
 description = "检测并解除 Windows 文件占用"
 edition = "2021"
 rust-version = "1.77"
