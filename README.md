@@ -1,56 +1,122 @@
+<div align="center">
+
+<img src="src-tauri/icons/icon.png" width="88" alt="FileUnlocker" />
+
 # FileUnlocker
 
-一个小工具，解决一个具体的问题：文件被占用删不掉、移不动，系统只告诉你"文件已在 xxx 中打开"，却不让你做任何事。
+**谁锁了我的文件？一查便知，一键释放。**
 
-把它拖入文件（或在文件上右键选择"解除文件占用"），它会列出当前锁住这个文件的所有进程，点一下就能结束进程、释放占用。也可以直接把文件删掉——即使它还被锁着，可以安排在下次重启时由系统删除。
+文件被占用删不掉、移不动，系统只说"文件已在 xxx 中打开"，却不给任何办法——
+把它拖进来，占用它的进程一目了然。
 
-## 能做什么
+[![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?logo=windows11&logoColor=white)](#-系统要求)
+[![Release](https://img.shields.io/github/v/release/NoraStory/file-unlocker?color=green&logo=github)](https://github.com/NoraStory/file-unlocker/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-8A2BE2.svg)](LICENSE)
+![Size](https://img.shields.io/badge/%E4%B8%BB%E7%A8%8B%E5%BA%8F-3.3%20MB-orange)
 
-- 找出占用文件的进程，显示进程名、所在路径、PID，以及程序的文件描述（比如显示"腾讯桌面整理"而不是一堆看不懂的 exe 名）
-- 结束单个进程，或者连子进程一起结束（进程树）
-- 删除文件；文件被锁死删不掉时，可以计划重启后删除
-- 右键菜单集成，单实例运行（连着右键几个文件不会开一串窗口）
+**[下载最新版](https://github.com/NoraStory/file-unlocker/releases/latest)** · [加入右键菜单](#-右键菜单) · [自己构建](#-构建)
 
-检测用两条路：一是 Windows 自带的 Restart Manager，这是资源管理器判断"文件正在使用"用的同一套机制，结果可靠；二是遍历系统句柄表，把每个文件句柄的路径和目标文件比对。第二条路能抓到第一条漏掉的占用，比如某些系统服务悄悄持有的句柄。两条路的结果合并去重。
+</div>
 
-## 构建
+---
 
-需要 Rust（MSVC 工具链）和 Node.js。
+## 这是什么
 
-```bash
-npm install
-npm run tauri build
-```
+一个 Windows 桌面小工具，专门解决"文件被占用"这件事：
 
-产物：
+- 拖入（或右键）任意文件 → 列出当前锁住它的**全部进程**
+- 每个进程显示 PID、路径、程序描述——看到的是"腾讯桌面整理"而不是 `QQPCRTP.exe`
+- 点一下结束进程，或连子进程一起结束（进程树）
+- 文件被锁死删不掉？可以**删除**，或者**计划下次重启时由系统删除**（那时锁早没了）
 
-- 免安装单文件：`src-tauri/target/release/file-unlocker.exe`
-- NSIS 安装包：`src-tauri/target/release/bundle/nsis/`
+## 检测原理
 
-程序默认要求管理员权限运行（结束系统进程、扫描句柄都需要）。不想要的话，把 `src-tauri/build.rs` 里的 `requireAdministrator` 改成 `asInvoker` 重新编译即可，普通权限下大部分功能仍可用。
+两条独立的路，结果合并去重：
+
+1. **Restart Manager** —— 资源管理器判断"文件正在使用"用的同一套机制，结果权威，还附带应用显示名
+2. **全系统句柄扫描** —— 遍历系统句柄表，逐个解析文件句柄的真实路径再比对。能抓到 Restart Manager 漏掉的占用，比如某些系统服务悄悄持有的句柄
+
+部分新版 Windows（实测 25H2）上 Restart Manager 对第三方进程的查询会异常，此时句柄扫描独立扛下全部工作，**不影响使用**。
+
+## 实测环境
+
+以下数据全部来自真实运行，非理论值：
+
+| 项目 | 环境 |
+|---|---|
+| 操作系统 | Windows 11 家庭中文版 26200（25H2） |
+| CPU | AMD Ryzen 7 8845H |
+| 内存 | 16 GB |
+| 主程序体积 | 3.3 MB（单文件免安装） |
+| 安装包体积 | 1.1 MB（NSIS） |
+| 支持系统 | Windows 10 1809+ / 11，x64 |
+
+> 程序以管理员权限运行（结束系统进程、扫描句柄都需要）。
+> 普通权限下检测和删除个人文件仍可用，仅结束系统进程会被拒绝。
+
+## 下载使用
+
+到 [Releases](https://github.com/NoraStory/file-unlocker/releases) 页面：
+
+| 文件 | 说明 |
+|---|---|
+| `FileUnlocker_x.y.z_x64-setup.exe` | 安装版，装完自动创建开始菜单项 |
+| `file-unlocker.exe` | 免安装单文件，下载即用 |
+
+使用方式三选一：**拖文件进窗口** · **点窗口选文件** · **右键菜单**（见下节）
 
 ## 右键菜单
 
-以管理员运行 `scripts/register-context-menu.bat`（会自动弹 UAC），或者在文件管理器里把 exe 拖到脚本上。卸载用 `scripts/unregister-context-menu.bat`。
+注册脚本在 `scripts/` 目录，双击运行，UAC 弹窗点"是"即可：
 
-Windows 11 的新版右键菜单可能把它收进"显示更多选项"里，按住 Shift 再右键能直接看到。
-
-跑测试：
-
-```bash
-cargo test --lib
+```
+register-context-menu.bat     注册（也可把 exe 拖到脚本上注册任意位置）
+unregister-context-menu.bat   卸载
 ```
 
-测试不要用 `cargo test` 直接跑——bin 目标的测试二进制会被强制要求管理员权限，普通终端跑不起来，这是构建链的限制，全部测试都放在了 lib 里。
+注册后，任意文件或文件夹右键即出现"解除文件占用"，固定在菜单顶部。
 
-## 一些说明
+> Windows 11 的新版右键菜单可能把它收进"显示更多选项"，按住 **Shift** 再右键能直接看到。
 
-"结束进程"用的是 TerminateProcess，没有商量余地，点之前看清是哪个进程。少数受系统保护的进程（如 csrss.exe）Windows 会拒绝终止，这是正常现象。
+## 构建
 
-"重启后删除"的原理是把路径写进 PendingFileRenameOperations，由内核在下次启动早期执行删除。对付被死锁的文件很有效，但别对系统目录下的东西用。
+需要 Rust（MSVC 工具链）和 Node.js 18+：
 
-检测句柄那一步是只读的，不会干扰目标进程；碰到没有权限打开的进程会自动跳过。
+```bash
+git clone https://github.com/NoraStory/file-unlocker.git
+cd file-unlocker
+npm install
+npm run tauri build     # 产物在 src-tauri/target/release/
+npm run tauri dev       # 开发调试
+cargo test --lib        # 运行测试
+```
 
-代码结构：`src-tauri/src/` 下 `lock_detector.rs` 是检测和结束进程，`handle_scan.rs` 是句柄扫描，`winutil.rs` 是些系统调用的公共封装，`file_actions.rs` 是删除相关，`lib.rs` 串起 Tauri 的命令。前端在 `src/`，Svelte 5 + Tailwind。
+不想要求管理员权限的话，把 `src-tauri/build.rs` 里的 `requireAdministrator` 改成 `asInvoker` 重新编译。
 
-License: MIT
+> 注意：跑测试请用 `cargo test --lib`。直接 `cargo test` 会因为构建链把提权 manifest 链进 bin 测试目标而要求管理员终端。
+
+## 项目结构
+
+```
+src/                          前端（Svelte 5 + Tailwind CSS 4）
+  App.svelte                  主界面
+  lib/api.ts                  Tauri IPC 封装与输入校验
+src-tauri/src/
+  lock_detector.rs            双引擎合并、结束进程/进程树
+  handle_scan.rs              全系统句柄扫描
+  winutil.rs                  进程路径、版本信息、错误码翻译
+  file_actions.rs             删除 / 重启后删除
+  lib.rs                      Tauri 命令、单实例、启动参数
+scripts/                      右键菜单注册脚本、图标生成
+```
+
+## 须知
+
+- 结束进程不可撤销，点之前看清是哪个程序
+- 少数受系统保护的进程（如 `csrss.exe`）Windows 会拒绝终止，这是系统设计，不是 bug
+- "重启后删除"写入 `PendingFileRenameOperations`，由内核在下次启动早期执行，别对系统文件用
+- 句柄扫描是只读的，不干扰目标进程；没权限的进程自动跳过
+
+## License
+
+[MIT](LICENSE)
