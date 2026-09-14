@@ -102,14 +102,16 @@ export async function takePendingFile(): Promise<string | null> {
   }
 }
 
-/** 弹出系统文件选择对话框（真实路径） */
+/**
+ * 弹出系统文件选择对话框（真实路径）。
+ * 用户取消返回 null；调用失败（如权限缺失）向上抛出，
+ * 由界面展示——权限类静默失败（capabilities 漏配等）不应无反馈。
+ */
 export async function pickFile(): Promise<string | null> {
   try {
     const path = await open({ multiple: false, title: "选择要检测的文件" });
     return typeof path === "string" ? path : null;
   } catch (e) {
-    // 用户取消对话框在某些平台也会 reject，静默处理
-    console.error("文件选择对话框失败:", toErrorMessage(e));
-    return null;
+    throw new Error(`打开文件选择器失败：${toErrorMessage(e)}`);
   }
 }

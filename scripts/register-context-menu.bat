@@ -18,15 +18,19 @@ if %errorlevel% neq 0 (
 
 set "EXE=%~1"
 if "%EXE%"=="" (
-    rem 默认找 cargo 产物或 NSIS 安装后的程序名
+    rem 依次回退：cargo 产物 → NSIS 默认安装位置 → NSIS PerMachine 备选
     if exist "%~dp0..\src-tauri\target\release\file-unlocker.exe" (
         set "EXE=%~dp0..\src-tauri\target\release\file-unlocker.exe"
     ) else if exist "%~dp0..\src-tauri\target\release\FileUnlocker.exe" (
         set "EXE=%~dp0..\src-tauri\target\release\FileUnlocker.exe"
+    ) else if exist "%ProgramFiles%\FileUnlocker\FileUnlocker.exe" (
+        set "EXE=%ProgramFiles%\FileUnlocker\FileUnlocker.exe"
+    ) else if exist "%LocalAppData%\FileUnlocker\FileUnlocker.exe" (
+        set "EXE=%LocalAppData%\FileUnlocker\FileUnlocker.exe"
     )
 )
 if "%EXE%"=="" (
-    echo [!] 未找到程序，请先执行 npm run tauri build
+    echo [!] 未找到程序，请先执行 npm run tauri build 或安装 NSIS 安装包
     echo     或把 FileUnlocker.exe 拖到本脚本上重新运行
     pause
     exit /b 1

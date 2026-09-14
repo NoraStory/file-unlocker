@@ -24,26 +24,44 @@
   let killingPid = $state<number | null>(null);
   let fileActionBusy = $state<"" | "delete" | "delete-reboot">("");
   let fileNotice = $state<string | null>(null);
+  /** 当前目标是文件夹（右键菜单支持文件夹入口） */
+  let isDirectory = $state(false);
 
   /** 全局互斥：任一后端操作进行中时，其它操作按钮全部禁用 */
   let busy = $derived(scanning || killingPid !== null || fileActionBusy !== "");
 
+  /**
+   * 扫描代次：防止并发扫描交叠（事件路径不受 busy 按钮禁用约束）。
+   * 每次发起 scan 递增，await 返回后若代次已变说明有更新的扫描接手，
+   * 当前结果作废不再写入 state——UI 始终显示最后一次请求的结果。
+   */
+  let scanGeneration = 0;
+
   let unlisteners: Array<() => void> = [];
 
   async function scan(path: string) {
+    const gen = ++scanGeneration;
     filePath = path;
+    // 文件夹入口：句柄扫描可查目录占用，但删除/重启删除语义不同
+    isDirectory = path.endsWith("\\") || path.endsWith("/");
     error = null;
     fileNotice = null;
     scanning = true;
     try {
-      processes = await getLockingProcesses(path);
+      const list = await getLockingProcesses(path);
+      if (gen !== scanGeneration) return; // 已被更新的扫描取代
+      processes = list;
       scanned = true;
     } catch (e) {
+      if (gen !== scanGeneration) return;
       processes = [];
       scanned = true;
       error = toErrorMessage(e);
     } finally {
-      scanning = false;
+      // 只有最新一次扫描有权熄灭"扫描中"指示
+      if (gen === scanGeneration) {
+        scanning = false;
+      }
     }
   }
 
@@ -102,8 +120,13 @@
 
   async function chooseFile() {
     if (busy) return;
-    const path = await pickFile();
-    if (path) await scan(path);
+    try {
+      const path = await pickFile();
+      if (path) await scan(path);
+    } catch (e) {
+      // 对话框打不开（如权限被拒）必须让用户看到原因，不能静默
+      error = toErrorMessage(e);
+    }
   }
 
   onMount(() => {
@@ -337,7 +360,7 @@
     </div>
   </section>
 
-  <!-- 文件处置区 -->
+  <!-- 文件处置区：文件夹模式只允许查占用，删除语义不适用 -->
   {#if filePath && scanned}
     <footer class="flex flex-col gap-2">
       {#if fileNotice}
@@ -347,6 +370,11 @@
           style="color: var(--ok); border-color: var(--ok);"
         >{fileNotice}</div>
       {/if}
+      {#if isDirectory}
+        <div class="card px-4 py-2.5 text-xs" in:fade={{ duration: 150 }}>
+          📁 文件夹模式：仅查询占用进程，删除操作不适用于文件夹
+        </div>
+      {:else}
       <div class="flex items-center gap-2">
         <button
           class="danger-btn flex-1 px-3 py-2.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
@@ -364,6 +392,7 @@
           {#if fileActionBusy === "delete-reboot"}正在计划…{:else}重启后删除（占用时）{/if}
         </button>
       </div>
+      {/if}
     </footer>
   {/if}
 </div>

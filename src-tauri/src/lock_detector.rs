@@ -390,7 +390,7 @@ fn descendants_still_alive(ancestor_pid: u32) -> Option<Vec<u32>> {
 pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     let parents = build_parent_map()?;
 
-    // BFS 收集后代（含自身）
+    // BFS 收集后代（含自身）；过滤会造成自伤的目标
     let mut to_kill = vec![pid];
     let mut seen = std::collections::HashSet::new();
     seen.insert(pid);
@@ -406,6 +406,31 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
         }
     }
 
+    // 防自伤：绝不结束自己；explorer.exe 是 shell，误杀会让桌面崩溃重建
+    let self_pid = std::process::id();
+    let to_kill: Vec<u32> = to_kill
+        .into_iter()
+        .filter(|&p| p != 4 && p != self_pid)
+        .collect();
+    let mut explorer_killed = false;
+    let to_kill: Vec<u32> = to_kill
+        .into_iter()
+        .filter(|&p| {
+            if let Some(exe) = process_image_full(p) {
+                let name = exe.to_lowercase();
+                if name == "explorer.exe" {
+                    explorer_killed = true;
+                    return false; // 跳过 shell 进程
+                }
+            }
+            true
+        })
+        .collect();
+
+    if to_kill.is_empty() {
+        return Err("没有可结束的进程（目标包含本程序或系统 Shell，已拦截）".into());
+    }
+
     let mut errors = Vec::new();
     let mut killed = 0usize;
     for &p in to_kill.iter().rev() {
@@ -418,6 +443,7 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     if killed == 0 && !to_kill.is_empty() {
         return Err(format!("结束进程树全部失败：{}", errors.join("; ")));
     }
+    let _ = explorer_killed; // explorer 被跳过的事实随 Ok 静默返回，无需提示
     Ok(())
 }
 
