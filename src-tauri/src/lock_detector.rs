@@ -139,7 +139,12 @@ fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> 
 ///
 /// 目标是文件夹时：递归收集目录内（含子目录）被锁定的文件，
 /// 结果按进程聚合——"谁占了文件夹里的东西"，附带各进程占用的文件数。
-pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
+/// `on_progress` 在目录模式下被调用（已完成/总数），
+/// 单文件模式不产生进度事件。
+pub fn get_locking_processes(
+    file_path: &str,
+    on_progress: &dyn Fn(usize, usize),
+) -> Result<Vec<ProcessInfo>, String> {
     // 输入校验：前端传来的路径必须真实存在，避免下游错误难排查
     if file_path.is_empty() {
         return Err("文件路径为空".into());
@@ -151,7 +156,7 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
 
     // 目录模式：枚举内部文件逐个检测后按 PID 聚合
     if path.is_dir() {
-        return scan_directory(path);
+        return scan_directory(path, on_progress);
     }
 
     scan_single_file(file_path)
@@ -161,7 +166,10 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
 ///
 /// 句柄扫描对"查询目录本身"无效（锁的是内部文件，路径不等），
 /// 所以必须展开到文件粒度。为控制耗时限制最大扫描文件数。
-fn scan_directory(dir: &Path) -> Result<Vec<ProcessInfo>, String> {
+fn scan_directory(
+    dir: &Path,
+    on_progress: &dyn Fn(usize, usize),
+) -> Result<Vec<ProcessInfo>, String> {
     const MAX_FILES: usize = 2000;
 
     let mut files = Vec::new();
@@ -183,6 +191,7 @@ fn scan_directory(dir: &Path) -> Result<Vec<ProcessInfo>, String> {
         }
     }
 
+    let total = files.len();
     // 每个文件跑一次检测，按 PID 聚合并统计占用的文件数
     use std::collections::HashMap;
     let mut merged: HashMap<u32, ProcessInfo> = HashMap::new();
@@ -205,6 +214,7 @@ fn scan_directory(dir: &Path) -> Result<Vec<ProcessInfo>, String> {
                 info.source = "directory_scan".into();
             }
         }
+        on_progress(scanned_files, total);
     }
 
     if scanned_files == 0 && !files.is_empty() {

@@ -37,7 +37,7 @@ fn main() {
     println!("== 锁定文件: {path_str}");
 
     // 1. 双引擎合并检测：无论 RM 在该系统是否可用，句柄扫描保证结果正确
-    match lock_detector::get_locking_processes(&path_str) {
+    match lock_detector::get_locking_processes(&path_str, &|_, _| {}) {
         Ok(list) => {
             println!("== 检测到 {} 个占用进程", list.len());
             for p in &list {

@@ -37,6 +37,9 @@
    */
   let scanGeneration = 0;
 
+  /** 目录模式扫描进度：null 表示无进度（单文件模式/未在扫描） */
+  let scanProgress = $state<{ done: number; total: number } | null>(null);
+
   let unlisteners: Array<() => void> = [];
 
   async function scan(path: string) {
@@ -46,6 +49,7 @@
     isDirectory = path.endsWith("\\") || path.endsWith("/");
     error = null;
     fileNotice = null;
+    scanProgress = null;
     scanning = true;
     try {
       const list = await getLockingProcesses(path);
@@ -61,6 +65,7 @@
       // 只有最新一次扫描有权熄灭"扫描中"指示
       if (gen === scanGeneration) {
         scanning = false;
+        scanProgress = null;
       }
     }
   }
@@ -135,6 +140,14 @@
       unlisteners.push(
         await listen<string>("new-file", (e) => {
           if (e.payload) scan(e.payload);
+        }),
+      );
+
+      // 目录模式扫描进度（done, total）
+      unlisteners.push(
+        await listen<[number, number]>("scan-progress", (e) => {
+          const [done, total] = e.payload;
+          scanProgress = { done, total };
         }),
       );
 
@@ -281,7 +294,25 @@
             <path d="M21 12a9 9 0 1 1-2.64-6.36" />
             <polyline points="21 3 21 9 15 9" />
           </svg>
-          <span class="dim text-sm">正在通过 Restart Manager 扫描…</span>
+          <span class="dim text-sm">正在扫描…</span>
+          {#if scanProgress}
+            <div class="w-56">
+              <div
+                class="h-1.5 w-full overflow-hidden rounded-full"
+                style="background: var(--stroke);"
+              >
+                <div
+                  class="h-full rounded-full transition-all duration-150"
+                  style="width: {Math.round((scanProgress.done / Math.max(scanProgress.total, 1)) * 100)}%; background: var(--accent);"
+                ></div>
+              </div>
+              <div class="dim mt-1.5 text-center text-xs">
+                目录模式：{scanProgress.done} / {scanProgress.total} 个文件
+              </div>
+            </div>
+          {:else}
+            <span class="dim text-xs">正在通过 Restart Manager 检测…</span>
+          {/if}
         </div>
       {:else if !scanned}
         <div class="flex h-full min-h-32 items-center justify-center">

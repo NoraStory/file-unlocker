@@ -33,8 +33,21 @@ fn push_file(app: &tauri::AppHandle, path: String) {
 }
 
 #[tauri::command]
-fn get_locking_processes(file_path: String) -> Result<Vec<ProcessInfo>, String> {
-    lock_detector::get_locking_processes(&file_path)
+fn get_locking_processes(
+    window: tauri::Window<tauri::Wry>,
+    file_path: String,
+) -> Result<Vec<ProcessInfo>, String> {
+    // 目录模式可能扫描数千文件、耗时数秒，向前端发进度事件；
+    // 节流：每个文件都 emit 太频繁，按已完成的 2% 或每 20 个发一次
+    let last = std::sync::atomic::AtomicUsize::new(0);
+    let on_progress = |done: usize, total: usize| {
+        let step = (total / 50).max(1);
+        let now = done / step;
+        if now != last.swap(now, std::sync::atomic::Ordering::Relaxed) || done == total {
+            let _ = window.emit("scan-progress", (done, total));
+        }
+    };
+    lock_detector::get_locking_processes(&file_path, &on_progress)
 }
 
 #[tauri::command]
