@@ -171,7 +171,15 @@ fn check_handle_scan() -> DiagItem {
         return fail("句柄扫描引擎", format!("探针文件创建失败：{e}"));
     };
 
-    let pids = crate::handle_scan::scan(&probe);
+    let pids = match crate::handle_scan::scan(&probe) {
+        Ok(pids) => pids,
+        Err(e) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            log::warn!("[自检] 句柄扫描引擎失效: {e}");
+            return fail("句柄扫描引擎", format!("扫描引擎失效：{e}"));
+        }
+    };
     drop(file);
     let _ = std::fs::remove_file(&probe);
 

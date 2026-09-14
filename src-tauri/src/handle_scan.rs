@@ -45,13 +45,15 @@ struct HandleEntry {
     _reserved: u32,
 }
 
-/// 两阶段 NtQuerySystemInformation 调用：
-/// 先小缓冲探测所需大小，再精确分配——避免旧实现直接清零 64MB 缓冲的浪费
-/// （句柄表实测约 11MB，64MB 的 memset 与重复拷贝是主要开销之一）。
+/// 稳健的两阶段 NtQuerySystemInformation 调用：
+/// 先小缓冲探测所需大小，内核返回可靠大小时一次到位；
+/// 部分系统 ret 不可靠（返回 0），此时按 4 倍增长重试并记录日志。
+/// 重试上限 12 次（64KB×4^11 远超 max_len，由 max_len 截断），
+/// 保证 11MB 级句柄表在 ret=0 的环境下也能在数次内命中。
 fn query_system_info(class: u32, max_len: u32) -> Option<Vec<u8>> {
-    let mut len = 0x1000u32; // 4KB 探测
+    let mut len = 0x1_0000u32; // 64KB 起步
     let mut needed = 0u32;
-    for _ in 0..8 {
+    for attempt in 0..12 {
         let mut buf = vec![0u8; len as usize];
         let status = unsafe {
             NtQuerySystemInformation(
@@ -62,18 +64,27 @@ fn query_system_info(class: u32, max_len: u32) -> Option<Vec<u8>> {
             )
         };
         if status == STATUS_INFO_LENGTH_MISMATCH {
-            len = if needed > len { needed } else { len * 2 };
-            if len > max_len {
+            let next = if needed > len { needed } else { len * 4 };
+            if next > max_len {
+                log::error!(
+                    "[句柄扫描] 快照查询所需缓冲 {next} 字节超过上限 {max_len}"
+                );
                 return None;
             }
+            log::debug!(
+                "[句柄扫描] 快照查询第 {attempt} 次缓冲不足 (needed={needed}, {len}→{next})"
+            );
+            len = next;
             continue;
         }
         if status.0 != 0 {
+            log::error!("[句柄扫描] 快照查询失败 (NTSTATUS 0x{:08x})", status.0);
             return None;
         }
         buf.truncate(needed as usize);
         return Some(buf);
     }
+    log::error!("[句柄扫描] 快照查询重试耗尽 (最终 len={len})");
     None
 }
 
@@ -124,7 +135,7 @@ fn file_type_index_in(buf: &[u8], count: usize, entry_size: usize) -> Option<u16
 #[doc(hidden)]
 #[cfg(feature = "e2e")]
 pub fn bench_scan(path: &std::path::Path) -> Vec<u32> {
-    scan(path)
+    scan(path).unwrap_or_default()
 }
 
 /// 枚举全系统句柄，返回当前持有 `path` 的进程 PID 集合。
@@ -132,12 +143,13 @@ pub fn bench_scan(path: &std::path::Path) -> Vec<u32> {
 /// 比对规则：`\\?\` 前缀归一化 + 大小写不敏感的完整路径匹配。
 /// File 对象类型索引通过"探针句柄"在**同一次句柄表快照**上测定——
 /// 类型索引的数值不稳定（每次查询可能漂移），必须与扫描共用同一快照。
-/// 失败时返回空集合（调用方仍有 Restart Manager 的结果兜底）。
-pub fn scan(path: &Path) -> Vec<u32> {
+///
+/// 扫描引擎本身失效（快照查询失败等）返回 Err，与"无占用"的空结果
+/// 明确区分——上层不得把失效伪装成"文件未被占用"。
+pub fn scan(path: &Path) -> Result<Vec<u32>, String> {
     let target = normalize_path(path);
-    collect_handle_paths_if(&|resolved: &str| resolved.to_lowercase() == target)
-        .map(|map| map.into_keys().collect())
-        .unwrap_or_default()
+    let map = collect_handle_paths_if(&|resolved: &str| resolved.to_lowercase() == target)?;
+    Ok(map.into_keys().collect())
 }
 
 /// 目录模式批量扫描：一次句柄表遍历，找出持有 `dir` 下任意文件句柄的
@@ -149,7 +161,7 @@ pub fn scan_directory(
     dir: &Path,
     on_progress: &(dyn Fn(usize, usize) + Sync),
     total_hint: usize,
-) -> std::collections::HashMap<u32, Vec<String>> {
+) -> Result<std::collections::HashMap<u32, Vec<String>>, String> {
     let mut prefix = normalize_path(dir);
     if !prefix.ends_with('\\') {
         prefix.push('\\');
@@ -166,9 +178,9 @@ pub fn scan_directory(
             }
         }
         hit
-    });
+    })?;
     on_progress(total_hint, total_hint);
-    result.unwrap_or_default()
+    Ok(result)
 }
 
 /// 归一化：小写、去掉 `\\?\` 前缀
@@ -199,22 +211,24 @@ unsafe impl Sync for SendHandle {}
 ///    系统调用是主要开销，CPU 核越多收益越大
 fn collect_handle_paths_if(
     hit: &(dyn Fn(&str) -> bool + Sync),
-) -> Option<std::collections::HashMap<u32, Vec<String>>> {
+) -> Result<std::collections::HashMap<u32, Vec<String>>, String> {
     enable_debug_privilege();
 
     // 拉取一次句柄表快照，类型探测与匹配共用这份数据
-    let buf = query_system_info(SYSTEM_EXTENDED_HANDLE_INFORMATION, 0x2000_0000)?;
+    let buf = query_system_info(SYSTEM_EXTENDED_HANDLE_INFORMATION, 0x2000_0000)
+        .ok_or_else(|| "系统句柄表快照查询失败（重试耗尽）".to_string())?;
     if buf.len() < std::mem::size_of::<HandleInfoHeader>() {
-        return None;
+        return Err("句柄表快照数据异常（过短）".into());
     }
     let count = unsafe { (*(buf.as_ptr() as *const HandleInfoHeader)).number_of_handles };
     let entry_size = std::mem::size_of::<HandleEntry>();
     if std::mem::size_of::<HandleInfoHeader>() + count * entry_size > buf.len() {
-        return None; // 数据在两次调用间变化，宁可放弃也不越界
+        return Err("句柄表在两次调用间变化，快照不一致".into());
     }
 
     // 在同一快照上测定 File 类型索引（能解析出磁盘路径的索引即 File）
-    let file_index = file_type_index_in(&buf, count, entry_size)?;
+    let file_index = file_type_index_in(&buf, count, entry_size)
+        .ok_or_else(|| "无法测定文件句柄类型索引（句柄表快照不完整）".to_string())?;
 
     // 收集 File 类型候选句柄（一次纯内存遍历，微秒级）
     let mut candidates: Vec<(u32, usize, u32)> = Vec::new();
@@ -324,5 +338,5 @@ fn collect_handle_paths_if(
         }
     }
 
-    Some(results.into_inner().unwrap())
+    Ok(results.into_inner().unwrap())
 }

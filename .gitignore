@@ -1,6 +1,7 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/target2/
 src-tauri/gen/schemas/
 .mimosa/
 *.local

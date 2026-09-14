@@ -234,8 +234,20 @@ fn scan_directory(
         }
     }
 
-    // 句柄扫描：单次遍历 + 目录前缀匹配
-    let hit_map = handle_scan::scan_directory(dir, on_progress, total);
+    // 句柄扫描：单次遍历 + 目录前缀匹配；引擎失效时不得伪装成"无占用"
+    let hit_map = match handle_scan::scan_directory(dir, on_progress, total) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("[检测] 句柄扫描引擎失效: {e}");
+            // RM 侧也失败则整体报错，否则以 RM 结果为准
+            if merged.is_empty() {
+                return Err(format!("检测引擎异常：{e}"));
+            }
+            let mut list: Vec<ProcessInfo> = merged.into_values().collect();
+            list.sort_by_key(|p| p.pid);
+            return Ok(list);
+        }
+    };
     for (pid, paths) in hit_map {
         let entry = merged.entry(pid).or_insert_with(|| {
             let exe_path = process_image_full(pid).unwrap_or_default();
@@ -366,8 +378,9 @@ fn scan_single_file(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
     let rm_result = query_restart_manager(file_path);
     let rm_list = rm_result.clone().unwrap_or_default();
 
-    // 引擎 2：句柄枚举扫描补漏
-    let hm_pids = handle_scan::scan(Path::new(file_path));
+    // 引擎 2：句柄枚举扫描补漏（引擎失效时与 RM 结果联合判断）
+    let hm_result = handle_scan::scan(Path::new(file_path));
+    let hm_pids: Vec<u32> = hm_result.clone().unwrap_or_default();
 
     // 合并去重：rm 为主（有 app_name），句柄扫描补漏
     use std::collections::HashMap;
@@ -423,14 +436,21 @@ fn scan_single_file(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
         }
     }
 
-    // rm 查询彻底失败且句柄扫描也没结果时，才把错误带出去。
-    // 部分系统（如 Win11 25H2 26100+）上 RM 服务对普通进程查询一律返回
-    // 错误，此时句柄扫描是唯一引擎，不能因 RM 失败而整体报错。
+    // 结果判定：
+    // - 句柄扫描引擎失效（Err）且 RM 无结果 → 整体报错，不得伪装"无占用"
+    // - 句柄扫描正常（Ok 空）→ 结果可信
+    // - RM 失败但句柄扫描正常（部分系统 RM 服务异常）→ 句柄扫描独立兜底
     if merged.is_empty() {
+        if let Err(e) = hm_result {
+            let rm_failed = rm_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+            log::error!("[检测] 双引擎均无结果：句柄扫描={e}；RM={rm_failed}");
+            return Err(format!(
+                "检测引擎异常（句柄扫描：{e}；Restart Manager：{rm_failed}）。请运行自检并导出日志反馈"
+            ));
+        }
         if let Err(e) = rm_result {
             // RM 失败但句柄扫描正常完成且无结果 → 结果可信，返回"无占用"
-            // （扫描引擎独立于 RM，不受其服务状态影响）
-            eprintln!("[warn] Restart Manager 不可用（{e}），已由句柄扫描兜底");
+            log::warn!("[检测] Restart Manager 不可用（{e}），已由句柄扫描兜底");
         }
         return Ok(Vec::new());
     }
