@@ -27,14 +27,65 @@ fn validate_path(path: &str, must_exist: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 解析待校验路径的真实形态，堵住纯字符串前缀匹配的绕过面：
+/// 打开句柄用 GetFinalPathNameByHandleW 取最终路径——跟随 junction/symlink、
+/// 展开 8.3 短名（C:\Progra~1 → C:\Program Files）。
+/// 目标不存在（重启删除允许不存在）时逐级对存在的祖先目录解析后拼回剩余部分；
+/// 祖先都不存在时退化为 GetLongPathNameW 仅展开短名。
+fn resolved_for_check(path: &str) -> String {
+    if let Some(final_path) = crate::winutil::final_path_of(path) {
+        return final_path;
+    }
+    let p = Path::new(path);
+    let mut ancestor = p.parent();
+    while let Some(dir) = ancestor {
+        if let Some(base) = crate::winutil::final_path_of(&dir.to_string_lossy()) {
+            match p.strip_prefix(dir) {
+                Ok(rel) => {
+                    let rel = rel.to_string_lossy().replace('/', "\\");
+                    return if rel.is_empty() { base } else { format!("{base}\\{rel}") };
+                }
+                Err(_) => break,
+            }
+        }
+        ancestor = dir.parent();
+    }
+    long_path_name(path)
+}
+
+/// GetLongPathNameW 展开 8.3 短名（不跟随 junction/symlink 的最后兜底）；
+/// 展开失败退回原路径，前缀匹配仍然兜底
+fn long_path_name(path: &str) -> String {
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    let wide = to_wide(path);
+    let mut len = 1024usize;
+    loop {
+        let mut buf = vec![0u16; len];
+        let n = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
+        if n == 0 {
+            return path.to_string();
+        }
+        if n <= buf.len() {
+            return crate::winutil::utf16_string(&buf[..n]);
+        }
+        if n > 32767 {
+            return path.to_string();
+        }
+        len = n;
+    }
+}
+
 /// 判断路径是否为系统关键位置——这些位置禁止删除，防止误操作损坏系统。
 /// 只覆盖操作系统与全局程序目录；用户目录（C:\Users\...）是本工具的
 /// 主战场，不在保护之列。
 ///
-/// 比较前必须先归一化：`C:/Windows/...`（正斜杠）与 `\\?\C:\Windows`
-/// （NT 前缀）都能逃过朴素的文本前缀匹配，但 DeleteFileW 都接受。
+/// 比较前必须先归一化：先做真实路径解析（跟随 junction、展开 8.3 短名），
+/// 再处理 `C:/Windows/...`（正斜杠）与 `\\?\C:\Windows`（NT 前缀）等形式——
+/// 它们都能逃过朴素的文本前缀匹配，但 DeleteFileW 都接受。
 fn is_protected_location(path: &str) -> bool {
-    let mut lower = path.trim().to_lowercase().replace('/', "\\");
+    // 解析后的路径已是长名最终形态（\\?\ 前缀已在解析层剥离）
+    let resolved = resolved_for_check(path);
+    let mut lower = resolved.trim().to_lowercase().replace('/', "\\");
     for prefix in [r"\\?\", r"\\.\"] {
         if let Some(stripped) = lower.strip_prefix(prefix) {
             lower = stripped.to_string();
@@ -127,6 +178,39 @@ mod tests {
         // 保护规则的错误应是"受保护"而非"不存在"——注意 must_exist 校验
         // 先行，因此用确实存在的系统文件断言错误类型
         let err = delete_file("C:\\Windows\\explorer.exe").unwrap_err();
+        assert!(err.contains("受保护"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_short_name_bypass() {
+        // 8.3 短名（C:\Progra~1）经最终路径解析后必须命中 Program Files 保护；
+        // 仅在标准布局（Program Files 位于 C 盘）机器上断言
+        let pf = std::env::var("ProgramFiles")
+            .unwrap_or_default()
+            .to_lowercase();
+        if !pf.starts_with("c:\\program files") {
+            return;
+        }
+        let err = delete_on_reboot("C:\\Progra~1\\fu-bypass-probe.dll").unwrap_err();
+        assert!(err.contains("受保护"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_junction_bypass() {
+        // 指向系统目录的 junction 经最终路径解析后同样命中保护
+        let link = std::env::temp_dir().join("fu_junction_probe");
+        let _ = std::fs::remove_dir(&link);
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(r"C:\Windows")
+            .output();
+        if out.map(|o| !o.status.success()).unwrap_or(true) {
+            return; // 无法创建 junction 的环境上跳过
+        }
+        let probe = link.join("fu-junction-probe.dll");
+        let err = delete_on_reboot(&probe.to_string_lossy()).unwrap_err();
+        let _ = std::fs::remove_dir(&link); // 删 junction 本身，不影响目标
         assert!(err.contains("受保护"), "unexpected: {err}");
     }
 

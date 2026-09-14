@@ -1,18 +1,18 @@
 {
-  "version": "0.3.1",
-  "notes": "FileUnlocker 0.3.1 更新",
+  "version": "0.3.2",
+  "notes": "FileUnlocker 0.3.2 更新",
   "assets": [
     {
-      "name": "FileUnlocker_0.3.1_x64-setup.exe",
+      "name": "FileUnlocker_0.3.2_x64-setup.exe",
       "kind": "installer",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.1/FileUnlocker_0.3.1_x64-setup.exe",
-      "sha256": "f4d76c4dc4d7e0ec4c146ef4da56867151ca7d0c113fe2101737473b02c124e1"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.2/FileUnlocker_0.3.2_x64-setup.exe",
+      "sha256": "55d5a227a55b5acaf884de5840240b3510456fd39008950baa6caf01345ff069"
     },
     {
       "name": "file-unlocker.exe",
       "kind": "portable",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.1/file-unlocker.exe",
-      "sha256": "2898919b6ea6f9a2c93d35df04dc35a54bd4ba128af8bffe1803d51e86891bbd"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.2/file-unlocker.exe",
+      "sha256": "e16269c9e730e3485e381d3425e3d26911b6a4e38293a580e4146f1aa8b0ece9"
     }
   ]
 }

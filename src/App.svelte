@@ -2,7 +2,6 @@
   import { onMount } from "svelte";
   import { fly, fade } from "svelte/transition";
   import { listen } from "@tauri-apps/api/event";
-  import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     getLockingProcesses,
@@ -20,6 +19,7 @@
     exportLogs,
     checkUpdate,
     downloadUpdate,
+    getAppVersion,
     toErrorMessage,
     type DiagItem,
     type UpdateInfo,
@@ -229,31 +229,47 @@
     }
   }
 
-  /** 检查更新 */
-  async function checkForUpdates() {
+  /**
+   * 检查更新。silent 用于启动时的静默复查：失败仅 console.warn，
+   * 成功也不弹面板；手动检查失败时保留已有 updateInfo
+   * （启动时已知的新版本徽标不能因为检查失败而消失）。
+   */
+  async function checkForUpdates(silent = false) {
     updateChecking = true;
-    updateError = null;
-    updateInfo = null;
+    if (!silent) updateError = null;
     try {
       const info = await checkUpdate();
-      updateOpen = true;
       if (info) {
         updateInfo = info;
+        if (!silent) updateOpen = true;
+      } else if (!silent) {
+        updateInfo = null;
+        updateError = "已是最新版本";
+        updateOpen = true;
+      }
+    } catch (e) {
+      if (silent) {
+        console.warn("静默检查更新失败:", toErrorMessage(e));
       } else {
-        updateError = "已是最新版本，或更新源暂时不可达";
+        updateError = `检查更新失败：${toErrorMessage(e)}`;
+        updateOpen = true;
       }
     } finally {
       updateChecking = false;
     }
   }
 
+  /** 安装包资产（后端只接受 installer；缺失时禁止下载并提示） */
+  let updateInstaller = $derived(
+    updateInfo?.assets.find((a) => a.kind === "installer") ?? null,
+  );
+
   /** 下载并安装更新 */
   async function doDownloadUpdate() {
     if (!updateInfo || updateDownloading) return;
-    const installer = updateInfo.assets.find((a) => a.kind === "installer")
-      ?? updateInfo.assets[0];
+    const installer = updateInstaller;
     if (!installer) {
-      updateError = "更新清单中没有可安装的资产";
+      updateError = "无安装包资产，无法自动安装";
       return;
     }
     updateDownloading = true;
@@ -271,11 +287,7 @@
 
   /** 版本号：从后端 manifest 读取 */
   async function fetchVersion() {
-    try {
-      appVersion = await invoke<string>("app_version");
-    } catch {
-      appVersion = "";
-    }
+    appVersion = await getAppVersion();
   }
 
   onMount(() => {
@@ -288,8 +300,11 @@
       );
 
       // 目录模式扫描进度（done, total）
+      // 只有进行中的扫描才接受进度事件：kill 失败后的静默重刷、
+      // 旧扫描的迟到事件都不应把 scanProgress 置为非 null 污染新扫描 UI
       unlisteners.push(
         await listen<[number, number]>("scan-progress", (e) => {
+          if (!scanning) return;
           const [done, total] = e.payload;
           scanProgress = { done, total };
         }),
@@ -339,6 +354,7 @@
         updateInfo = pendingUpdate;
         updateOpen = true;
       }
+
     })();
 
     return () => {
@@ -387,7 +403,7 @@
       <button
         class="rounded-md px-2 py-1 text-xs transition hover:opacity-80 active:scale-95"
         style="background: var(--stroke);"
-        onclick={checkForUpdates}
+        onclick={() => checkForUpdates()}
         disabled={updateChecking}
       >{updateChecking ? "检查中…" : "检查更新"}</button>
       <button
@@ -502,14 +518,17 @@
           {:else}
             <button
               class="accent-btn px-3 py-2 text-sm font-medium disabled:opacity-50"
-              disabled={updateDownloading}
+              disabled={updateDownloading || !updateInstaller}
               onclick={doDownloadUpdate}
             >{updateDownloading ? "准备下载…" : "下载并安装"}</button>
+            {#if !updateInstaller}
+              <div class="text-xs" style="color: var(--danger);">无安装包资产，无法自动安装</div>
+            {/if}
           {/if}
         {:else}
           <div class="dim text-sm">{updateError || "正在查询…"}</div>
         {/if}
-        {#if updateError}
+        {#if updateInfo && updateError}
           <div class="text-xs" style="color: var(--danger);">{updateError}</div>
         {/if}
       </div>

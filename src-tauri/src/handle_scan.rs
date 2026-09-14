@@ -10,14 +10,12 @@ use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
     STATUS_INFO_LENGTH_MISMATCH,
 };
-use windows::Win32::Storage::FileSystem::{
-    GetFinalPathNameByHandleW, GetFileType, FILE_NAME_NORMALIZED, FILE_TYPE_DISK,
-};
+use windows::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
 };
 
-use crate::winutil::enable_debug_privilege;
+use crate::winutil::{enable_debug_privilege, final_path_from_handle};
 
 /// SystemExtendedHandleInformation 的信息类别码
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
@@ -99,7 +97,6 @@ fn query_system_info(class: u32, max_len: u32) -> Option<Vec<u8>> {
 fn file_type_index_in(buf: &[u8], count: usize, entry_size: usize) -> Option<u16> {
     let my_pid = std::process::id() as usize;
     let mut candidates: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
-    let mut name_buf = [0u16; 1024];
 
     for i in 0..count {
         let entry = unsafe {
@@ -115,11 +112,8 @@ fn file_type_index_in(buf: &[u8], count: usize, entry_size: usize) -> Option<u16
         // 自身句柄直接解析，零复制开销
         let handle = HANDLE(entry.handle as *mut core::ffi::c_void);
         let is_disk = unsafe { GetFileType(handle) } == FILE_TYPE_DISK;
-        let mut path_hit = false;
-        if is_disk {
-            let n = unsafe { GetFinalPathNameByHandleW(handle, &mut name_buf, FILE_NAME_NORMALIZED) };
-            path_hit = n > 0 && (n as usize) <= name_buf.len();
-        }
+        // 能解析出磁盘路径的句柄必是 File 对象；路径解析缓冲按返回值增长
+        let path_hit = is_disk && final_path_from_handle(handle).is_some();
         if path_hit {
             *candidates.entry(entry.object_type_index).or_insert(0) += 1;
         }
@@ -175,13 +169,12 @@ pub fn scan_directory(
     )
 }
 
-/// 归一化：小写、去掉 `\\?\` 前缀
+/// 归一化：剥离 `\\?\` 设备前缀（UNC 还原为 `\\server\share`）后小写。
+/// GetFinalPathNameByHandleW 对 UNC 返回 `\\?\UNC\server\share\...`，
+/// 若只剥前缀会得到 `unc\server\share`，与前端传入的 `\\server\share`
+/// 永不相等——网络共享文件会恒漏报。
 fn normalize_path(path: &Path) -> String {
-    let mut s = path.to_string_lossy().to_lowercase();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        s = stripped.to_string();
-    }
-    s
+    crate::winutil::strip_device_prefix(&path.to_string_lossy()).to_lowercase()
 }
 
 /// 跨线程传递的进程句柄包装：HANDLE 仅按数值语义使用，
@@ -191,8 +184,8 @@ struct SendHandle(HANDLE);
 unsafe impl Send for SendHandle {}
 unsafe impl Sync for SendHandle {}
 
-/// 一次全系统句柄表遍历：解析每个 File 句柄的 DOS 路径（去掉 `\\?\`），
-/// 对 `hit` 返回 true 的路径按 pid 收集。
+/// 一次全系统句柄表遍历：解析每个 File 句柄的 DOS 路径（剥离 `\\?\` 设备前缀，
+/// UNC 还原为 `\\server\share`），对 `hit` 返回 true 的路径按 pid 收集。
 /// `progress` 非空时按"已处理候选数 / 候选总数"周期性上报。
 ///
 /// 性能设计（精度不变的前提下提速）：
@@ -253,7 +246,6 @@ fn collect_handle_paths_if(
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| {
-                let mut name_buf = [0u16; 1024];
                 loop {
                     let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if idx >= candidates.len() {
@@ -305,16 +297,8 @@ fn collect_handle_paths_if(
 
                     // 只解析磁盘文件句柄，跳过命名管道等可能阻塞的对象类型
                     if unsafe { GetFileType(dup) } == FILE_TYPE_DISK {
-                        let n = unsafe {
-                            // FILE_NAME_NORMALIZED(0) 与 VOLUME_NAME_DOS(0) 都是 0，
-                            // 等价于默认值组合
-                            GetFinalPathNameByHandleW(dup, &mut name_buf, FILE_NAME_NORMALIZED)
-                        };
-                        if n > 0 && (n as usize) <= name_buf.len() {
-                            let mut resolved = String::from_utf16_lossy(&name_buf[..n as usize]);
-                            if let Some(stripped) = resolved.strip_prefix(r"\\?\") {
-                                resolved = stripped.to_string();
-                            }
+                        // 缓冲按返回值增长（winutil::final_path_from_handle），长路径不漏报
+                        if let Some(resolved) = final_path_from_handle(dup) {
                             if hit(&resolved) {
                                 results
                                     .lock()
@@ -347,4 +331,39 @@ fn collect_handle_paths_if(
     }
 
     Ok(results.into_inner().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_device_prefix() {
+        assert_eq!(
+            normalize_path(std::path::Path::new(r"\\?\C:\Data\F.TXT")),
+            r"c:\data\f.txt"
+        );
+    }
+
+    #[test]
+    fn normalize_restores_unc_prefix() {
+        // GetFinalPathNameByHandleW 对 UNC 返回 \\?\UNC\server\share，
+        // 必须还原为 \\server\share，否则网络共享文件恒漏报
+        assert_eq!(
+            normalize_path(std::path::Path::new(r"\\?\UNC\NAS\Docs\f.txt")),
+            r"\\nas\docs\f.txt"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_plain_unc_and_local() {
+        assert_eq!(
+            normalize_path(std::path::Path::new(r"\\NAS\Docs\f.txt")),
+            r"\\nas\docs\f.txt"
+        );
+        assert_eq!(
+            normalize_path(std::path::Path::new(r"C:\Data\f.txt")),
+            r"c:\data\f.txt"
+        );
+    }
 }

@@ -222,8 +222,15 @@ fn scan_directory(
             continue; // 无权限的子目录跳过
         };
         for entry in entries.flatten() {
+            // entry.file_type() 不跟随重解析点；path.is_dir() 会跟随链接，
+            // junction/symlink 环会死循环，同一文件也会被重复统计到触顶 MAX_FILES。
+            // Windows 上 junction（MOUNT_POINT）与 symlink 的 is_symlink() 都为 true
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue; // junction / 符号链接目录：不下钻、不统计
+            }
             let p = entry.path();
-            if p.is_dir() {
+            if ft.is_dir() {
                 stack.push(p);
             } else if files.len() < MAX_FILES {
                 files.push(p);
@@ -694,7 +701,7 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
         .into_iter()
         .filter(|&p| p != 4 && p != self_pid)
         .collect();
-    let mut explorer_killed = false;
+    let mut skipped_explorer: Vec<u32> = Vec::new();
     let to_kill: Vec<u32> = to_kill
         .into_iter()
         .filter(|&p| {
@@ -707,13 +714,20 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
                     .unwrap_or("")
                     .to_lowercase();
                 if name == "explorer.exe" {
-                    explorer_killed = true;
+                    skipped_explorer.push(p);
                     return false; // 跳过 shell 进程
                 }
             }
             true
         })
         .collect();
+    if !skipped_explorer.is_empty() {
+        // 跳过事实必须可观测：否则"进程树为何没死干净"无从排查
+        log::info!(
+            "[结束进程树] 已跳过系统 Shell explorer.exe（pid {:?}），避免桌面崩溃重建",
+            skipped_explorer
+        );
+    }
 
     if to_kill.is_empty() {
         return Err("没有可结束的进程（目标包含本程序或系统 Shell，已拦截）".into());
@@ -731,7 +745,14 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     if killed == 0 && !to_kill.is_empty() {
         return Err(format!("结束进程树全部失败：{}", errors.join("; ")));
     }
-    let _ = explorer_killed; // explorer 被跳过的事实随 Ok 静默返回，无需提示
+    // 部分成功不得静默吞掉失败：逐条入日志，便于排查漏网的占用进程
+    if !errors.is_empty() {
+        log::warn!(
+            "[结束进程树] 部分进程结束失败（成功 {killed}/{}）：{}",
+            to_kill.len(),
+            errors.join("; ")
+        );
+    }
     Ok(())
 }
 

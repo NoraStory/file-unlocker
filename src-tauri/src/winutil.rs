@@ -36,21 +36,101 @@ pub fn utf16_string(buf: &[u16]) -> String {
 pub fn process_image_full(pid: u32) -> Option<String> {
     let handle =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    let mut buf = [0u16; 1024];
-    let mut len = buf.len() as u32;
-    let result = unsafe {
-        QueryFullProcessImageNameW(
-            HANDLE(handle.0),
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
+    // 映像路径可超 MAX_PATH（长路径/\\?\ 形式）：1024 起步，缓冲不足按失败翻倍，上限 32767
+    let mut len = 1024usize;
+    let result = loop {
+        let mut buf = vec![0u16; len];
+        let mut size = buf.len() as u32;
+        let r = unsafe {
+            QueryFullProcessImageNameW(
+                HANDLE(handle.0),
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut size,
+            )
+        };
+        if r.is_ok() {
+            break Some(String::from_utf16_lossy(&buf[..size as usize]));
+        }
+        use windows::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER};
+        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || len >= 32767 {
+            break None;
+        }
+        len *= 2;
     };
     unsafe {
         let _ = CloseHandle(HANDLE(handle.0));
     }
-    result.ok()?;
-    Some(String::from_utf16_lossy(&buf[..len as usize]))
+    result
+}
+
+/// 去掉 Win32 设备路径前缀：`\\?\C:\...` → `C:\...`；
+/// UNC 设备路径还原为 `\\server\share`（`\\?\UNC\server\share` → `\\server\share`）。
+/// 大小写保持原样，需要归一化的调用方自行处理。
+pub fn strip_device_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        // GetFinalPathNameByHandleW 固定返回大写 "UNC"，用户传入可能为小写，两种都认
+        let unc = rest
+            .strip_prefix(r"UNC\")
+            .or_else(|| rest.strip_prefix(r"unc\"));
+        if let Some(unc) = unc {
+            return format!(r"\\{unc}");
+        }
+        return rest.to_string();
+    }
+    path.to_string()
+}
+
+/// 从已打开的句柄取最终路径（跟随 junction/symlink）。
+/// GetFinalPathNameByHandleW 缓冲不足时返回所需长度（含 NUL），
+/// 按返回值增长重试（1024 起步、上限 32767），长路径不漏报。
+pub fn final_path_from_handle(handle: HANDLE) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED};
+    let mut len = 1024usize;
+    loop {
+        let mut buf = vec![0u16; len];
+        // FILE_NAME_NORMALIZED(0) 与 VOLUME_NAME_DOS(0) 都是 0，等价于默认值组合
+        let n = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n <= buf.len() {
+            return Some(strip_device_prefix(&String::from_utf16_lossy(&buf[..n])));
+        }
+        if n > 32767 {
+            log::warn!("[路径] 最终路径超过 32767 字符上限（需要 {n}）");
+            return None;
+        }
+        len = n;
+    }
+}
+
+/// 打开文件/目录并解析其最终路径（跟随 junction/symlink、展开 8.3 短名）。
+/// 仅需元数据查询（访问权限 0），共享模式放到最宽，尽量打开成功；
+/// 打不开（不存在/被独占占用）时返回 None，由调用方降级处理。
+pub fn final_path_of(path: &str) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let wide = to_wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            0, // 无访问权限需求（仅查询路径）
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, // 允许打开目录
+            None,
+        )
+    }
+    .ok()?;
+    let result = final_path_from_handle(handle);
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    result
 }
 
 /// 读取 exe 的版本信息中的 FileDescription（如 "Microsoft Word"）。
@@ -84,6 +164,8 @@ pub fn file_description(exe_path: &str) -> Option<String> {
         .as_bool()
     };
 
+    // 注意：VerQueryValueW 的 puLen 单位是字节。
+    // Translation 表每项 4 字节（LANGID + CODEPAGE 两个 u16），故下限 4
     if !query("\\VarFileInfo\\Translation", &mut ptr, &mut len) || len < 4 {
         return None;
     }
@@ -96,7 +178,8 @@ pub fn file_description(exe_path: &str) -> Option<String> {
     if !query(&key, &mut ptr, &mut len) || len == 0 {
         return None;
     }
-    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u16, len as usize) };
+    // puLen 是字节数：按 u16 读取必须 /2，直接当字符数会越界一倍（UB）
+    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u16, len as usize / 2) };
     let desc = utf16_string(slice);
     if desc.is_empty() {
         None
@@ -124,8 +207,10 @@ pub fn win32_err(e: &windows::core::Error) -> String {
 }
 
 /// 端到端验证用的直接删除探针（不走 file_actions 的系统目录保护，
-/// 专门验证"占用中删除失败、释放后删除成功"的原始语义）
-#[cfg(feature = "e2e")]
+/// 专门验证"占用中删除失败、释放后删除成功"的原始语义）。
+/// 注意：不能 cfg(feature = "e2e") 门控——examples/e2e_check.rs 用 #[path]
+/// 内嵌本文件，`cargo test` 不带 feature 构建示例时会编译失败
+#[allow(dead_code)] // 主程序不调用；仅示例（#[path] 内嵌另一编译单元）使用
 pub fn e2e_delete_probe(path: &str) -> Result<(), String> {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::DeleteFileW;
@@ -208,5 +293,13 @@ mod tests {    use super::*;
         assert_eq!(win32_code(&e), 5);
         let msg = win32_err(&e);
         assert!(msg.contains("拒绝访问"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn strip_device_prefix_handles_local_and_unc() {
+        assert_eq!(strip_device_prefix(r"\\?\C:\Windows"), r"C:\Windows");
+        assert_eq!(strip_device_prefix(r"\\?\UNC\server\share"), r"\\server\share");
+        assert_eq!(strip_device_prefix(r"\\?\unc\server\share"), r"\\server\share");
+        assert_eq!(strip_device_prefix(r"C:\plain"), r"C:\plain");
     }
 }

@@ -1,14 +1,7 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
-# This workflow lets you generate SLSA provenance file for your project.
-# The generation satisfies level 3 for the provenance requirements - see https://slsa.dev/spec/v0.1/requirements
-# The project is an initiative of the OpenSSF (openssf.org) and is developed at
-# https://github.com/slsa-framework/slsa-github-generator.
-# The provenance file can be verified using https://github.com/slsa-framework/slsa-verifier.
-# For more information about SLSA and how it improves the supply-chain, visit slsa.dev.
+# 为 GitHub Release 中的真实产物（NSIS 安装包 / 便携版 exe）生成 SLSA Level 3 provenance。
+# 触发时机：release 发布时。注意需先把产物作为 release assets 上传（如 gh release create v0.3.2 <files>），
+# 本 workflow 会直接下载该 release 的全部 .exe 资产并计算 sha256。
+# 验证方式：https://github.com/slsa-framework/slsa-verifier
 
 name: SLSA generic generator
 on:
@@ -23,35 +16,27 @@ jobs:
       digests: ${{ steps.hash.outputs.digests }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      # ========================================================
-      #
-      # Step 1: Build your artifacts.
-      #
-      # ========================================================
-      - name: Build artifacts
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-            # These are some amazing artifacts.
-            echo "artifact1" > artifact1
-            echo "artifact2" > artifact2
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          if [ -z "$tag" ]; then tag="${{ github.ref_name }}"; fi
+          mkdir -p artifacts
+          gh release download "$tag" --pattern "*.exe" --dir artifacts --clobber
+          ls -la artifacts
 
-      # ========================================================
-      #
-      # Step 2: Add a step to generate the provenance subjects
-      #         as shown below. Update the sha256 sum arguments
-      #         to include all binaries that you generate
-      #         provenance for.
-      #
-      # ========================================================
       - name: Generate subject for provenance
         id: hash
         run: |
           set -euo pipefail
-
-          # List the artifacts the provenance will refer to.
-          files=$(ls artifact*)
-          # Generate the subjects (base64 encoded).
+          cd artifacts
+          files=$(ls)
+          if [ -z "$files" ]; then
+            echo "release 中没有 .exe 资产，无法生成 provenance" >&2
+            exit 1
+          fi
           echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
 
   provenance:

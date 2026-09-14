@@ -22,14 +22,14 @@ fn fail(name: &str, detail: impl Into<String>) -> DiagItem {
 }
 
 /// 执行全部自检项
-pub fn run_diagnostics() -> Vec<DiagItem> {
+pub fn run_diagnostics(app: &tauri::AppHandle) -> Vec<DiagItem> {
     let mut items = Vec::new();
     items.push(check_admin());
     items.push(check_debug_privilege());
     items.push(check_restart_manager());
     items.push(check_handle_scan());
     items.push(check_context_menu());
-    items.push(check_log_writable());
+    items.push(check_log_writable(app));
     items.push(check_os_version());
     for item in &items {
         log::info!("[自检] {}: {} — {}", item.name, item.status, item.detail);
@@ -207,16 +207,22 @@ fn check_context_menu() -> DiagItem {
     }
 }
 
-/// 6. 日志目录可写
-fn check_log_writable() -> DiagItem {
-    let dir = std::env::temp_dir();
+/// 6. 日志目录可写（tauri_plugin_log 实际写入 app_log_dir，不是临时目录）
+fn check_log_writable(app: &tauri::AppHandle) -> DiagItem {
+    use tauri::Manager;
+    let dir = match app.path().app_log_dir() {
+        Ok(d) => d,
+        Err(e) => return warn("日志写入", format!("无法确定日志目录：{e}")),
+    };
+    // 日志插件初始化时会创建目录，这里保持一致后再探测实际可写性
+    let _ = std::fs::create_dir_all(&dir);
     let probe = dir.join(format!("fu_log_test_{}.tmp", std::process::id()));
     match std::fs::write(&probe, b"test") {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             ok("日志写入", format!("可写（日志目录：{}）", dir.display()))
         }
-        Err(e) => warn("日志写入", format!("临时目录写入失败：{e}")),
+        Err(e) => warn("日志写入", format!("日志目录写入失败：{e}（{}）", dir.display())),
     }
 }
 

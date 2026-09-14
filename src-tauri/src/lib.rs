@@ -34,7 +34,15 @@ fn push_file(app: &tauri::AppHandle, path: String) {
     state.0.lock().unwrap().replace(path.clone());
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_focus();
-        let _ = window.emit("new-file", path);
+        // 事件送达后清掉 pending：窗口已存在时 pending 多余，残留到下次
+        // mount 会被 take_pending_file 重复取走，旧文件再次被推给前端。
+        // 仅当 pending 仍是本次路径时才清，避免误清并发推入的更新路径
+        if window.emit("new-file", path.clone()).is_ok() {
+            let mut pending = state.0.lock().unwrap();
+            if pending.as_deref() == Some(path.as_str()) {
+                pending.take();
+            }
+        }
     }
 }
 
@@ -218,24 +226,24 @@ fn chrono_lite_stamp() -> String {
 
 /// 自检：检测权限、检测引擎、右键菜单、日志等必要前提
 #[tauri::command]
-async fn run_diagnostics() -> Vec<diagnostics::DiagItem> {
+async fn run_diagnostics(app: tauri::AppHandle) -> Vec<diagnostics::DiagItem> {
     log::info!("[自检] 开始");
-    tauri::async_runtime::spawn_blocking(diagnostics::run_diagnostics)
+    tauri::async_runtime::spawn_blocking(move || diagnostics::run_diagnostics(&app))
         .await
         .unwrap_or_default()
 }
 
-/// 检查更新（GitHub → Gitee 依次尝试）
+/// 检查更新（GitHub → Gitee 依次尝试）。
+/// 网络/解析失败返回 Err（原因向上抛给前端），无更新 Ok(None)，有更新 Ok(Some)
 #[tauri::command]
 async fn check_update(
     app: tauri::AppHandle,
-) -> Option<updater::UpdateInfo> {
+) -> Result<Option<updater::UpdateInfo>, String> {
     let current = app.package_info().version.to_string();
     log::info!("[更新] 手动检查，当前版本 {current}");
     tauri::async_runtime::spawn_blocking(move || updater::check_for_update(&current))
         .await
-        .ok()
-        .flatten()
+        .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
 /// 下载更新安装包（SHA256 校验后启动安装器）
@@ -325,22 +333,25 @@ pub fn run() {
             let handle = app.handle().clone();
             let current = app.package_info().version.to_string();
             tauri::async_runtime::spawn(async move {
-                let info = tauri::async_runtime::spawn_blocking(move || {
+                let result = tauri::async_runtime::spawn_blocking(move || {
                     updater::check_for_update(&current)
                 })
                 .await
-                .ok()
-                .flatten();
-                if let Some(info) = info {
-                    log::info!("[更新] 发现新版本 {}", info.version);
-                    // 先落地再 emit：窗口未就绪时事件会丢，前端挂载后主动取走
-                    handle
-                        .state::<PendingUpdate>()
-                        .0
-                        .lock()
-                        .unwrap()
-                        .replace(info.clone());
-                    let _ = handle.emit("update-available", info);
+                .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")));
+                match result {
+                    Ok(Some(info)) => {
+                        log::info!("[更新] 发现新版本 {}", info.version);
+                        // 先落地再 emit：窗口未就绪时事件会丢，前端挂载后主动取走
+                        handle
+                            .state::<PendingUpdate>()
+                            .0
+                            .lock()
+                            .unwrap()
+                            .replace(info.clone());
+                        let _ = handle.emit("update-available", info);
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::warn!("[更新] 静默检查失败: {e}"),
                 }
             });
             Ok(())

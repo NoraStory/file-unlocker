@@ -111,6 +111,15 @@ export async function takePendingFile(): Promise<string | null> {
   }
 }
 
+/** 当前应用版本号（读取失败返回空串，标题栏版本角标不显示） */
+export async function getAppVersion(): Promise<string> {
+  try {
+    return await invoke<string>("app_version");
+  } catch {
+    return "";
+  }
+}
+
 /**
  * 弹出系统文件选择对话框（真实路径）。
  * 用户取消返回 null；调用失败（如权限缺失）向上抛出，
@@ -188,13 +197,15 @@ export async function takePendingUpdate(): Promise<UpdateInfo | null> {
   }
 }
 
-/** 检查更新（GitHub → Gitee） */
+/**
+ * 检查更新（GitHub → Gitee）。失败时抛错（不吞成 null），
+ * 由调用方区分"检查失败"与"已是最新"。
+ */
 export async function checkUpdate(): Promise<UpdateInfo | null> {
   try {
     return await invoke<UpdateInfo | null>("check_update");
   } catch (e) {
-    console.error("check_update 失败:", toErrorMessage(e));
-    return null;
+    throw new Error(toErrorMessage(e));
   }
 }
 
