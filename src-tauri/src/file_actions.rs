@@ -28,17 +28,15 @@ fn validate_path(path: &str, must_exist: bool) -> Result<(), String> {
 }
 
 /// 判断路径是否为系统关键位置——这些位置禁止删除，防止误操作损坏系统。
+/// 只覆盖操作系统与全局程序目录；用户目录（C:\Users\...）是本工具的
+/// 主战场，不在保护之列。
 fn is_protected_location(path: &str) -> bool {
-    const PROTECTED: [&str; 5] = [
+    const PROTECTED: [&str; 3] = [
         "c:\\windows",
         "c:\\program files",
         "c:\\program files (x86)",
-        "c:\\programdata",
-        "c:\\users",
     ];
     let lower = path.to_lowercase();
-    // 允许这些目录下的具体文件被删除是不必要的风险敞口：直接整体保护。
-    // 用户若确需删除其中的文件，可手动操作。
     PROTECTED.iter().any(|dir| {
         lower == *dir || lower.starts_with(&format!("{dir}\\"))
     })
@@ -103,6 +101,10 @@ mod tests {
     fn rejects_protected_locations() {
         assert!(delete_file("C:\\Windows\\System32\\kernel32.dll").is_err());
         assert!(delete_on_reboot("c:\\Program Files\\x\\y.dll").is_err());
+        // 保护规则的错误应是"受保护"而非"不存在"——注意 must_exist 校验
+        // 先行，因此用确实存在的系统文件断言错误类型
+        let err = delete_file("C:\\Windows\\explorer.exe").unwrap_err();
+        assert!(err.contains("受保护"), "unexpected: {err}");
     }
 
     #[test]
@@ -111,5 +113,18 @@ mod tests {
         let err = delete_file("C:\\Users\\NonExistent\\a.txt").unwrap_err();
         assert!(err.contains("不存在"), "unexpected: {err}");
         assert!(!err.contains("受保护"));
+    }
+
+    #[test]
+    fn deletes_real_user_file() {
+        // 正向用例：用户目录下真实存在的文件应可删除（工具的核心场景）
+        let dir = std::env::temp_dir().join("file_unlocker_del_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("victim.txt");
+        std::fs::write(&path, b"to be deleted").unwrap();
+
+        delete_file(path.to_string_lossy().as_ref()).expect("删除用户文件失败");
+        assert!(!path.exists(), "文件删除后仍存在");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

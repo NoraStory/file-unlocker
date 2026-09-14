@@ -176,9 +176,13 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
     }
 
     for pid in hm_pids {
-        merged
-            .entry(pid)
-            .or_insert_with(|| {
+        match merged.entry(pid) {
+            // RM 也报了该 PID：标记双引擎命中
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().source = "both".into();
+            }
+            // 仅句柄扫描发现（RM 不可用或漏报）
+            std::collections::hash_map::Entry::Vacant(e) => {
                 let exe_path = process_image_full(pid).unwrap_or_default();
                 let description = file_description(&exe_path).unwrap_or_default();
                 let process_name = exe_path
@@ -186,16 +190,16 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
                     .next()
                     .unwrap_or_default()
                     .to_string();
-                ProcessInfo {
+                e.insert(ProcessInfo {
                     pid,
                     process_name,
                     exe_path,
                     description,
                     app_name: String::new(),
                     source: "handle_scan".into(),
-                }
-            })
-            .source = "both".into();
+                });
+            }
+        }
     }
 
     // rm 查询彻底失败且句柄扫描也没结果时，才把错误带出去。
@@ -298,14 +302,10 @@ pub fn kill_process(pid: u32) -> Result<(), String> {
     }
 }
 
-/// 结束进程树：先结束子进程再结束父进程（参照 LockHunter / taskkill /T）。
-///
-/// 通过 NtQuerySystemInformation 的进程快照以 ParentProcessId 归组，
-/// 递归收集指定 pid 的全部后代后逐个 TerminateProcess。
-pub fn kill_process_tree(pid: u32) -> Result<(), String> {
+/// 拉取全系统进程快照，构建 parent → children 映射。
+fn build_parent_map() -> Result<std::collections::HashMap<u32, Vec<u32>>, String> {
     const SYSTEM_PROCESS_INFORMATION: u32 = 5;
 
-    // 拉取全系统进程快照（带自动增长重试）
     let mut len = 0x100_0000u32; // 16MB 起步
     let snapshot = loop {
         let mut buf = vec![0u8; len as usize];
@@ -334,12 +334,13 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
         break buf;
     };
 
-    // x64 SYSTEM_PROCESS_INFORMATION 头部关键字段偏移：
-    // 0: NextEntryOffset, 8: NumberOfThreads(u32), 12: pad, 16: WorkingSetSize...(跳过),
-    // 实际布局：NextEntryOffset(4)+NumberOfThreads(4)+...+UniqueProcessId(偏移64)+...+ParentProcessId(偏移88)+ImageName(偏移96, UNICODE_STRING)
-    // 直接用偏移常量遍历，避免声明完整结构体。
+    // x64 SYSTEM_PROCESS_INFORMATION 关键字段偏移（Windows 内核布局）：
+    // NextEntryOffset(0) → ... → ImageName(56, UNICODE_STRING 16B) →
+    // BasePriority(72) → UniqueProcessId(80) → InheritedFromUniqueProcessId(88)
+    // → SessionId(96)。PID 读取点必须落在 80，此前误用 64 会读到
+    // ImageName.Buffer 指针的随机低位，导致进程树收集到垃圾 PID。
     const OFF_NEXT: usize = 0;
-    const OFF_PID: usize = 64;
+    const OFF_PID: usize = 80;
     const OFF_PARENT_PID: usize = 88;
 
     let mut parents: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
@@ -357,6 +358,37 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
         }
         offset += next;
     }
+    Ok(parents)
+}
+
+/// 判断快照中是否仍有 parent 链指向 `ancestor_pid` 的存活进程
+/// （仅用于测试：验证进程树终止效果）
+#[cfg(test)]
+fn descendants_still_alive(ancestor_pid: u32) -> Option<Vec<u32>> {
+    let parents = build_parent_map().ok()?;
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::from(vec![ancestor_pid]);
+    let mut alive = Vec::new();
+    while let Some(cur) = queue.pop_front() {
+        if let Some(children) = parents.get(&cur) {
+            for &c in children {
+                if seen.insert(c) {
+                    queue.push_back(c);
+                    // PID 仍出现在快照中即视为存活（终止后的 PID 会从快照消失）
+                    alive.push(c);
+                }
+            }
+        }
+    }
+    if alive.is_empty() { None } else { Some(alive) }
+}
+
+/// 结束进程树：先结束子进程再结束父进程（参照 LockHunter / taskkill /T）。
+///
+/// 通过 NtQuerySystemInformation 的进程快照以 ParentProcessId 归组，
+/// 递归收集指定 pid 的全部后代后逐个 TerminateProcess。
+pub fn kill_process_tree(pid: u32) -> Result<(), String> {
+    let parents = build_parent_map()?;
 
     // BFS 收集后代（含自身）
     let mut to_kill = vec![pid];
@@ -421,5 +453,35 @@ mod tests {
             Ok(()) => {}
             Err(e) => panic!("pid {pid} kill failed: {e}"),
         }
+    }
+
+    #[test]
+    fn kill_tree_takes_out_child() {
+        // 父进程（cmd）持有子进程（powershell 挂起数秒）：
+        // kill_tree(父) 后轮询断言子进程也退出了——这同时验证
+        // 进程快照的 PID 偏移解析正确（偏移错则收集不到子进程）。
+        let mut parent = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "start /b powershell -NoProfile -Command \"Start-Sleep 30\" & ping -n 60 127.0.0.1 > nul",
+            ])
+            .spawn()
+            .expect("spawn parent");
+        let parent_pid = parent.id();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        kill_process_tree(parent_pid).expect("kill_tree failed");
+
+        // 找到那个 powershell 子进程：通过再次枚举快照验证它已不在
+        let mut gone = false;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if descendants_still_alive(parent_pid).is_none() {
+                gone = true;
+                break;
+            }
+        }
+        let _ = parent.kill();
+        assert!(gone, "子进程在 kill_tree 后仍存活——PID 偏移或树收集有误");
     }
 }

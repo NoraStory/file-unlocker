@@ -1,3 +1,6 @@
+// 生成用：register-context-menu.bat 的 UTF-8 源模板。
+// 构建产物用 iconv 转 GBK + CRLF（中文 Windows cmd 的解析要求），
+// 保留此文件以便后续维护，直接改 .bat 会因编码问题损坏。
 @echo off
 rem ============================================
 rem FileUnlocker 右键菜单注册脚本
@@ -8,7 +11,8 @@ rem ============================================
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo [*] 正在请求管理员权限，请在 UAC 弹窗中点击"是"...
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    rem 用户拒绝 UAC 时，-Verb RunAs 抛异常；catch 分支保持窗口开启给出提示
+    powershell -NoProfile -Command "try { Start-Process -FilePath '%~f0' -Verb RunAs } catch { Write-Host ''; Write-Host '[!] 未获得管理员权限，注册已取消。'; Write-Host '    如需注册，请重新运行本脚本并在 UAC 弹窗中点击\"是\"。'; Start-Sleep -Seconds 5 }"
     exit /b
 )
 
