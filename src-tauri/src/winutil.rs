@@ -105,6 +105,24 @@ pub fn file_description(exe_path: &str) -> Option<String> {
     }
 }
 
+/// 从 `windows::core::Error` 提取 Win32 错误码（HRESULT 0x8007xxxx 的低 16 位）
+pub fn win32_code(e: &windows::core::Error) -> u32 {
+    (e.code().0 & 0xFFFF) as u32
+}
+
+/// 将 Win32 错误翻译为可读中文，常见错误码给出针对性提示
+pub fn win32_err(e: &windows::core::Error) -> String {
+    match win32_code(e) {
+        5 => "拒绝访问（可能需要管理员权限）".into(),
+        87 => "参数无效（进程可能已退出）".into(),
+        1168 => "找不到对应进程（可能已退出）".into(),
+        2 => "系统找不到指定的文件".into(),
+        3 => "系统找不到指定的路径".into(),
+        32 => "文件正被另一进程使用".into(),
+        _ => format!("{e} (错误码 {})", win32_code(e)),
+    }
+}
+
 /// 启用 SeDebugPrivilege（管理员默认持有但处于禁用状态）。
 /// 启用后才能枚举/复制 SYSTEM 等高权限进程的句柄，参照 handle.exe / File Locksmith。
 pub fn enable_debug_privilege() {
@@ -142,5 +160,41 @@ pub fn enable_debug_privilege() {
         // 这里尽力而为，失败不影响主流程（Restart Manager 仍然可用）。
         let _ = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
         let _ = CloseHandle(token);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_wide_appends_nul_terminator() {
+        let w = to_wide("ab");
+        assert_eq!(w, vec![b'a' as u16, b'b' as u16, 0]);
+    }
+
+    #[test]
+    fn to_wide_keeps_non_ascii() {
+        let w = to_wide("中文");
+        assert_eq!(w, vec!['中' as u16, '文' as u16, 0]);
+    }
+
+    #[test]
+    fn utf16_string_stops_at_nul() {
+        assert_eq!(utf16_string(&[b'a' as u16, 0, b'b' as u16]), "a");
+    }
+
+    #[test]
+    fn utf16_string_handles_missing_nul() {
+        assert_eq!(utf16_string(&[b'x' as u16]), "x");
+    }
+
+    #[test]
+    fn win32_code_maps_access_denied() {
+        // 0x80070005 → Win32 错误 5（拒绝访问）
+        let e = windows::core::Error::from_hresult(windows::core::HRESULT(0x8007_0005u32 as i32));
+        assert_eq!(win32_code(&e), 5);
+        let msg = win32_err(&e);
+        assert!(msg.contains("拒绝访问"), "unexpected: {msg}");
     }
 }

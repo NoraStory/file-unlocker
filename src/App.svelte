@@ -11,6 +11,7 @@
     deleteFileOnReboot,
     takePendingFile,
     pickFile,
+    toErrorMessage,
   } from "./lib/api";
   import type { ProcessInfo } from "./lib/types";
 
@@ -24,11 +25,15 @@
   let fileActionBusy = $state<"" | "delete" | "delete-reboot">("");
   let fileNotice = $state<string | null>(null);
 
+  /** 全局互斥：任一后端操作进行中时，其它操作按钮全部禁用 */
+  let busy = $derived(scanning || killingPid !== null || fileActionBusy !== "");
+
   let unlisteners: Array<() => void> = [];
 
   async function scan(path: string) {
     filePath = path;
     error = null;
+    fileNotice = null;
     scanning = true;
     try {
       processes = await getLockingProcesses(path);
@@ -36,42 +41,38 @@
     } catch (e) {
       processes = [];
       scanned = true;
-      error = e instanceof Error ? e.message : String(e);
+      error = toErrorMessage(e);
     } finally {
       scanning = false;
     }
   }
 
-  async function kill(pid: number) {
-    if (killingPid !== null || !filePath) return;
+  async function kill(pid: number, tree: boolean) {
+    if (busy || !filePath) return;
     killingPid = pid;
     error = null;
     try {
-      await killProcess(pid);
+      if (tree) {
+        await killProcessTree(pid);
+      } else {
+        await killProcess(pid);
+      }
       await scan(filePath);
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    } finally {
-      killingPid = null;
-    }
-  }
-
-  async function killTree(pid: number) {
-    if (killingPid !== null || !filePath) return;
-    killingPid = pid;
-    error = null;
-    try {
-      await killProcessTree(pid);
-      await scan(filePath);
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = toErrorMessage(e);
+      // 失败后仍刷新一次：进程可能实际已退出（如权限拒绝但进程崩溃）
+      try {
+        await getLockingProcesses(filePath).then((p) => (processes = p));
+      } catch {
+        /* 刷新失败保持原列表 */
+      }
     } finally {
       killingPid = null;
     }
   }
 
   async function doDelete(onReboot: boolean) {
-    if (!filePath || fileActionBusy !== "") return;
+    if (busy || !filePath) return;
     fileActionBusy = onReboot ? "delete-reboot" : "delete";
     error = null;
     fileNotice = null;
@@ -85,7 +86,7 @@
         clearFile();
       }
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = toErrorMessage(e);
     } finally {
       fileActionBusy = "";
     }
@@ -100,8 +101,9 @@
   }
 
   async function chooseFile() {
+    if (busy) return;
     const path = await pickFile();
-    if (typeof path === "string" && path) await scan(path);
+    if (path) await scan(path);
   }
 
   onMount(() => {
@@ -235,9 +237,9 @@
       </div>
       {#if filePath}
         <button
-          class="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition hover:opacity-80 active:scale-95"
+          class="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition hover:opacity-80 active:scale-95 disabled:opacity-50"
           style="background: var(--stroke);"
-          disabled={scanning}
+          disabled={busy}
           onclick={() => filePath && scan(filePath)}
         >
           <svg class={scanning ? "spin" : ""} width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -307,16 +309,16 @@
                 </div>
               </div>
               <button
-                class="shrink-0 rounded-md px-2 py-1.5 text-xs transition hover:opacity-80 active:scale-95"
+                class="shrink-0 rounded-md px-2 py-1.5 text-xs transition hover:opacity-80 active:scale-95 disabled:opacity-50"
                 style="background: var(--stroke);"
-                disabled={killingPid !== null}
+                disabled={busy}
                 title="结束该进程及其全部子进程"
-                onclick={() => killTree(p.pid)}
+                onclick={() => kill(p.pid, true)}
               >结束树</button>
               <button
-                class="danger-btn shrink-0 px-3 py-1.5 text-xs font-medium"
-                disabled={killingPid !== null}
-                onclick={() => kill(p.pid)}
+                class="danger-btn shrink-0 px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                disabled={busy}
+                onclick={() => kill(p.pid, false)}
               >
                 {#if killingPid === p.pid}
                   <svg class="spin inline-block align-[-2px]" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
@@ -347,16 +349,16 @@
       {/if}
       <div class="flex items-center gap-2">
         <button
-          class="danger-btn flex-1 px-3 py-2.5 text-sm font-medium"
-          disabled={fileActionBusy !== ""}
+          class="danger-btn flex-1 px-3 py-2.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+          disabled={busy}
           onclick={() => confirm(`确定永久删除文件？\n${filePath}`) && doDelete(false)}
         >
           {#if fileActionBusy === "delete"}正在删除…{:else}删除文件{/if}
         </button>
         <button
-          class="flex-1 rounded-lg px-3 py-2.5 text-sm font-medium transition hover:opacity-80 active:scale-[0.98]"
+          class="flex-1 rounded-lg px-3 py-2.5 text-sm font-medium transition hover:opacity-80 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
           style="background: var(--glass); border: 1px solid var(--stroke-strong);"
-          disabled={fileActionBusy !== ""}
+          disabled={busy}
           onclick={() => doDelete(true)}
         >
           {#if fileActionBusy === "delete-reboot"}正在计划…{:else}重启后删除（占用时）{/if}

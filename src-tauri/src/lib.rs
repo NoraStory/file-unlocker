@@ -48,7 +48,7 @@ fn kill_process_tree(pid: u32) -> Result<(), String> {
     lock_detector::kill_process_tree(pid)
 }
 
-/// 立即删除文件（需要文件未被占用；需确认 delete=true 防误触）
+/// 立即删除文件（delete=true 双重确认，防止误触；路径/系统目录校验在后端执行）
 #[tauri::command]
 fn delete_file(file_path: String, delete: bool) -> Result<(), String> {
     if !delete {
@@ -57,7 +57,7 @@ fn delete_file(file_path: String, delete: bool) -> Result<(), String> {
     file_actions::delete_file(&file_path)
 }
 
-/// 计划下次重启时删除文件（对被锁定的文件有效；需确认 delete=true 防误触）
+/// 计划下次重启时删除文件（delete=true 双重确认，防止误触）
 #[tauri::command]
 fn delete_file_on_reboot(file_path: String, delete: bool) -> Result<(), String> {
     if !delete {

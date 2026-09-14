@@ -13,15 +13,21 @@ use std::path::Path;
 
 use serde::Serialize;
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, STILL_ACTIVE, WAIT_TIMEOUT, WIN32_ERROR,
+};
+use windows::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows::Win32::System::RestartManager::{
     RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
     RM_PROCESS_INFO,
 };
-use windows::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+};
 
 use crate::handle_scan;
-use crate::winutil::{file_description, process_image_full, to_wide, utf16_string};
+use crate::winutil::{file_description, process_image_full, to_wide, utf16_string, win32_err};
 
 /// 正在锁定文件的进程信息
 #[derive(Debug, Clone, Serialize)]
@@ -65,8 +71,16 @@ impl Drop for RmSession {
     }
 }
 
-/// 引擎 1：Restart Manager 查询，返回 (pid → app_name)
+/// 引擎 1：Restart Manager 查询，返回 (pid → app_name)。
+///
+/// 资源注册阶段对"文件不存在"给出明确错误，其余阶段失败带错误码。
 fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> {
+    if file_path.is_empty() {
+        return Err("文件路径为空".into());
+    }
+    if !std::path::Path::new(file_path).exists() {
+        return Err(format!("文件不存在：{file_path}"));
+    }
     let wide_path = to_wide(file_path);
 
     let session = RmSession::start()?;
@@ -126,6 +140,14 @@ fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> 
 
 /// 查询锁定 `file_path` 的所有进程（双引擎合并）。
 pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
+    // 输入校验：前端传来的路径必须真实存在，避免下游错误难排查
+    if file_path.is_empty() {
+        return Err("文件路径为空".into());
+    }
+    if !Path::new(file_path).exists() {
+        return Err(format!("文件不存在：{file_path}"));
+    }
+
     // 引擎 1：Restart Manager（失败不致命，继续走句柄扫描）
     let rm_result = query_restart_manager(file_path);
     let rm_list = rm_result.clone().unwrap_or_default();
@@ -194,25 +216,84 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
 /// 强制结束单个进程（TerminateProcess）。
 ///
 /// 以管理员运行时可结束绝大多数进程；普通权限下对系统/提权进程会失败。
+/// 发出终止请求后等待最多 3 秒确认进程真正退出；
+/// "进程不存在" 视为已结束（目标早已退出是合法的成功场景）。
 pub fn kill_process(pid: u32) -> Result<(), String> {
     if pid == 0 {
         return Err("无效的进程 ID".into());
     }
+    // System 空闲进程等系统关键进程不可终止，提前拦截给出可读错误
+    if pid == 4 {
+        return Err("无法结束 System 进程（PID 4）".into());
+    }
 
-    let handle = use_winapi_open_process_terminate(pid)?;
+    // TERMINATE：终止请求；SYNCHRONIZE：WaitForSingleObject 确认退出；
+    // QUERY_LIMITED_INFORMATION：读取退出码判断进程是否已不存在
+    let access = PROCESS_TERMINATE
+        | PROCESS_ACCESS_RIGHTS(SYNCHRONIZE.0)
+        | PROCESS_QUERY_LIMITED_INFORMATION;
+    let handle = unsafe { OpenProcess(access, false, pid) }.map_err(|e| {
+        let msg = win32_err(&e);
+        if msg.contains("拒绝访问") {
+            format!("打开进程 {pid} 失败：{msg}；请确认程序以管理员身份运行")
+        } else {
+            format!("打开进程 {pid} 失败：{msg}")
+        }
+    })?;
+
+    // 目标可能早已退出（PID 残留时 OpenProcess 仍成功）：先查退出码，
+    // 已退出的进程视为"已结束"，避免对残留 PID 误报"拒绝访问"
+    let mut exit_code = 0u32;
+    if unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok()
+        && exit_code != STILL_ACTIVE.0 as u32
+    {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Ok(());
+    }
+
     let result = unsafe { TerminateProcess(handle, 1) };
+    if let Err(e) = result {
+        let code = crate::winutil::win32_code(&e);
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        // 1168 (ERROR_NOT_FOUND)：进程不存在，视为已结束
+        if code == 1168 {
+            return Ok(());
+        }
+        return Err(format!("结束进程 {pid} 失败：{}", win32_err(&e)));
+    }
+
+    // 等待最多 3 秒确认进程真正退出（TerminateProcess 是异步请求）
+    let mut exit_code = 0u32;
+    let mut exited = false;
+    for _ in 0..30 {
+        let wait = unsafe { WaitForSingleObject(handle, 100) };
+        if wait != WAIT_TIMEOUT {
+            exited = true;
+            break;
+        }
+        // 句柄无 SYNCHRONIZE 时等待可能立即返回失败，用退出码兜底判断
+        if unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok()
+            && exit_code != STILL_ACTIVE.0 as u32
+        {
+            exited = true;
+            break;
+        }
+    }
     unsafe {
         let _ = CloseHandle(handle);
     }
 
-    result.map_err(|e| format!("结束进程 {pid} 失败：{e}"))
-}
-
-fn use_winapi_open_process_terminate(
-    pid: u32,
-) -> Result<HANDLE, String> {
-    unsafe { windows::Win32::System::Threading::OpenProcess(PROCESS_TERMINATE, false, pid) }
-        .map_err(|e| format!("打开进程 {pid} 失败（可能需要管理员权限）：{e}"))
+    if exited {
+        Ok(())
+    } else {
+        Err(format!(
+            "结束进程 {pid} 的请求已发出，但 3 秒内未确认退出；进程可能受系统保护"
+        ))
+    }
 }
 
 /// 结束进程树：先结束子进程再结束父进程（参照 LockHunter / taskkill /T）。
@@ -292,18 +373,51 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     }
 
     let mut errors = Vec::new();
+    let mut killed = 0usize;
     for &p in to_kill.iter().rev() {
         // 先结束最深的后代
-        if let Err(e) = kill_process(p) {
-            // 进程可能已自行退出，忽略"找不到进程"类失败
-            errors.push(format!("{p}: {e}"));
+        match kill_process(p) {
+            Ok(()) => killed += 1,
+            Err(e) => errors.push(format!("{p}: {e}")),
         }
     }
-    if errors.len() == to_kill.len() && !to_kill.is_empty() {
-        return Err(format!(
-            "结束进程树全部失败：{}",
-            errors.join("; ")
-        ));
+    if killed == 0 && !to_kill.is_empty() {
+        return Err(format!("结束进程树全部失败：{}", errors.join("; ")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_rejects_zero_pid() {
+        assert!(kill_process(0).is_err());
+    }
+
+    #[test]
+    fn kill_rejects_system_process() {
+        let err = kill_process(4).unwrap_err();
+        assert!(err.contains("System"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn kill_nonexistent_process_is_success() {
+        // 启动一个几乎立即退出的短命进程（Windows 会回收 PID），
+        // 等待退出后其 PID 视为"进程不存在"，kill 应返回成功而非报错。
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let _ = child.wait();
+
+        // 稍等让系统完成 PID 清理
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        match kill_process(pid) {
+            Ok(()) => {}
+            Err(e) => panic!("pid {pid} kill failed: {e}"),
+        }
+    }
 }
