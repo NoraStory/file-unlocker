@@ -123,6 +123,19 @@ pub fn win32_err(e: &windows::core::Error) -> String {
     }
 }
 
+/// 端到端验证用的直接删除探针（不走 file_actions 的系统目录保护，
+/// 专门验证"占用中删除失败、释放后删除成功"的原始语义）
+#[cfg(feature = "e2e")]
+pub fn e2e_delete_probe(path: &str) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::DeleteFileW;
+    let wide = to_wide(path);
+    match unsafe { DeleteFileW(PCWSTR(wide.as_ptr())) } {
+        Ok(()) => Ok(()),
+        Err(e) => Err(win32_err(&e)),
+    }
+}
+
 /// 启用 SeDebugPrivilege（管理员默认持有但处于禁用状态）。
 /// 启用后才能枚举/复制 SYSTEM 等高权限进程的句柄，参照 handle.exe / File Locksmith。
 pub fn enable_debug_privilege() {
@@ -164,8 +177,7 @@ pub fn enable_debug_privilege() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests {    use super::*;
 
     #[test]
     fn to_wide_appends_nul_terminator() {

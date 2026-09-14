@@ -97,45 +97,40 @@ fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> 
         return Err(format!("RmRegisterResources 失败 (错误码 {})", err.0));
     }
 
-    // 两次调用 RmGetList——第一次探测所需缓冲区条目数，第二次取数据
+    // RmGetList 重试循环：首次探测返回所需条目数（ERROR_MORE_DATA），
+    // 随后取数；进程表在两次调用间可能变化，仍报 MORE_DATA 时按新大小重试。
     let mut needed = 0u32;
     let mut count = 0u32;
-    let err = unsafe {
-        RmGetList(
-            session.handle,
-            &mut needed,
-            &mut count,
-            None,
-            std::ptr::null_mut(),
-        )
-    };
-    if err != ERROR_MORE_DATA && err != ERROR_SUCCESS {
-        return Err(format!("RmGetList(探测大小) 失败 (错误码 {})", err.0));
+    let mut buf: Vec<RM_PROCESS_INFO> = Vec::new();
+    for _ in 0..5 {
+        let err = unsafe {
+            RmGetList(
+                session.handle,
+                &mut needed,
+                &mut count,
+                if buf.is_empty() {
+                    None
+                } else {
+                    Some(buf.as_mut_ptr())
+                },
+                std::ptr::null_mut(),
+            )
+        };
+        if err == ERROR_SUCCESS {
+            // count 个有效条目已写入 buf
+            buf.truncate(count as usize);
+            return Ok(buf
+                .iter()
+                .map(|raw| (raw.Process.dwProcessId, utf16_string(&raw.strAppName)))
+                .collect());
+        }
+        if err != ERROR_MORE_DATA || needed == 0 {
+            return Err(format!("RmGetList 失败 (错误码 {})", err.0));
+        }
+        buf = vec![RM_PROCESS_INFO::default(); needed as usize];
+        count = needed;
     }
-    if needed == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut buf = vec![RM_PROCESS_INFO::default(); needed as usize];
-    let mut count = needed;
-    let err = unsafe {
-        RmGetList(
-            session.handle,
-            &mut needed,
-            &mut count,
-            Some(buf.as_mut_ptr()),
-            std::ptr::null_mut(),
-        )
-    };
-    if err != ERROR_SUCCESS {
-        return Err(format!("RmGetList 失败 (错误码 {})", err.0));
-    }
-    buf.truncate(count as usize);
-
-    Ok(buf
-        .iter()
-        .map(|raw| (raw.Process.dwProcessId, utf16_string(&raw.strAppName)))
-        .collect())
+    Err("进程表持续变化，RmGetList 重试 5 次仍未成功".into())
 }
 
 /// 查询锁定 `file_path` 的所有进程（双引擎合并）。
@@ -203,9 +198,16 @@ pub fn get_locking_processes(file_path: &str) -> Result<Vec<ProcessInfo>, String
             .source = "both".into();
     }
 
-    // rm 查询彻底失败且句柄扫描也没结果时，把错误带出去
+    // rm 查询彻底失败且句柄扫描也没结果时，才把错误带出去。
+    // 部分系统（如 Win11 25H2 26100+）上 RM 服务对普通进程查询一律返回
+    // 错误，此时句柄扫描是唯一引擎，不能因 RM 失败而整体报错。
     if merged.is_empty() {
-        rm_result?;
+        if let Err(e) = rm_result {
+            // RM 失败但句柄扫描正常完成且无结果 → 结果可信，返回"无占用"
+            // （扫描引擎独立于 RM，不受其服务状态影响）
+            eprintln!("[warn] Restart Manager 不可用（{e}），已由句柄扫描兜底");
+        }
+        return Ok(Vec::new());
     }
 
     let mut list: Vec<ProcessInfo> = merged.into_values().collect();

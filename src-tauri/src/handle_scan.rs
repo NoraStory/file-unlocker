@@ -85,9 +85,84 @@ fn query_system_info(class: u32, initial_len: u32, max_len: u32) -> Option<Vec<u
     None
 }
 
-/// 遍历 SystemObjectTypeInformation 列表，找到 "File" 对象类型的索引。
-/// 句柄表条目中的 ObjectTypeIndex 与该列表序号对应。
-fn find_file_type_index() -> Option<u16> {
+/// 供诊断示例调用（内部函数的透传包装）
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn dbg_query(class: u32, initial_len: u32, max_len: u32) -> Option<Vec<u8>> {
+    query_system_info(class, initial_len, max_len)
+}
+
+/// 在给定句柄表快照上探测 File 对象类型索引：
+/// 遍历本进程的全部句柄条目，逐个复制并尝试解析路径——
+/// 能通过 GetFinalPathNameByHandleW 解析出磁盘路径的句柄必是 File 对象，
+/// 其类型索引即为所求。不依赖任何内核结构体布局，对所有 Windows 版本可靠。
+fn file_type_index_in(buf: &[u8], count: usize, entry_size: usize) -> Option<u16> {
+    let my_pid = std::process::id() as usize;
+    // 记录每个候选索引命中的次数
+    let mut candidates: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+    let mut name_buf = [0u16; 1024];
+    let me = unsafe { GetCurrentProcess() };
+
+    for i in 0..count {
+        let entry = unsafe {
+            *(buf.as_ptr().add(std::mem::size_of::<HandleInfoHeader>() + i * entry_size)
+                as *const HandleEntry)
+        };
+        if entry.process_id != my_pid {
+            continue;
+        }
+        if entry.object_type_index == 0 || entry.granted_access == 0 {
+            continue;
+        }
+
+        // 复制句柄并尝试解析路径；能解析出磁盘路径 ⇒ 该索引是 File
+        let Ok(proc) = (unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, my_pid as u32) }) else {
+            return None;
+        };
+        let mut dup = HANDLE::default();
+        let ok = unsafe {
+            DuplicateHandle(
+                proc,
+                HANDLE(entry.handle as _),
+                me,
+                &mut dup,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .is_ok();
+        unsafe {
+            let _ = CloseHandle(proc);
+        }
+        if !ok {
+            continue;
+        }
+        let is_disk = unsafe { GetFileType(dup) } == FILE_TYPE_DISK;
+        let mut path_hit = false;
+        if is_disk {
+            let n = unsafe { GetFinalPathNameByHandleW(dup, &mut name_buf, FILE_NAME_NORMALIZED) };
+            path_hit = n > 0 && (n as usize) <= name_buf.len();
+        }
+        unsafe {
+            let _ = CloseHandle(dup);
+        }
+        if path_hit {
+            *candidates.entry(entry.object_type_index).or_insert(0) += 1;
+        }
+    }
+
+    // 出现次数最多的候选索引即 File 类型（非 File 句柄不会解析出磁盘路径）
+    candidates
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(idx, _)| idx)
+}
+
+/// （老系统回退）遍历 SystemObjectTypeInformation 列表找 "File" 类型索引。
+/// 依赖 x64 SYSTEM_OBJECTTYPE_INFORMATION 布局，部分系统上不可靠。
+#[allow(dead_code)]
+fn find_file_type_index_by_name() -> Option<u16> {
     let buf = query_system_info(SYSTEM_OBJECT_TYPE_INFORMATION, 0x8000, 0x100000)?;
 
     let mut offset = 0usize;
@@ -119,13 +194,11 @@ fn find_file_type_index() -> Option<u16> {
 /// 枚举全系统句柄，返回当前持有 `path` 的进程 PID 集合。
 ///
 /// 比对规则：`\\?\` 前缀归一化 + 大小写不敏感的完整路径匹配。
+/// File 对象类型索引通过"探针句柄"在**同一次句柄表快照**上测定——
+/// 类型索引的数值不稳定（每次查询可能漂移），必须与扫描共用同一快照。
 /// 失败时返回空集合（调用方仍有 Restart Manager 的结果兜底）。
 pub fn scan(path: &Path) -> Vec<u32> {
     enable_debug_privilege();
-
-    let Some(file_index) = find_file_type_index() else {
-        return Vec::new();
-    };
 
     // 归一化目标路径
     let mut target = path.to_string_lossy().to_lowercase();
@@ -134,6 +207,7 @@ pub fn scan(path: &Path) -> Vec<u32> {
     }
     let target = target;
 
+    // 拉取一次句柄表快照，后续类型探测与扫描都在这份数据上进行
     let Some(buf) = query_system_info(SYSTEM_EXTENDED_HANDLE_INFORMATION, 0x400_0000, 0x2000_0000)
     else {
         return Vec::new();
@@ -141,17 +215,22 @@ pub fn scan(path: &Path) -> Vec<u32> {
     if buf.len() < std::mem::size_of::<HandleInfoHeader>() {
         return Vec::new();
     }
-
     let count = unsafe { (*(buf.as_ptr() as *const HandleInfoHeader)).number_of_handles };
     let entry_size = std::mem::size_of::<HandleEntry>();
-    let entries_end = std::mem::size_of::<HandleInfoHeader>() + count * entry_size;
-    if entries_end > buf.len() {
+    if std::mem::size_of::<HandleInfoHeader>() + count * entry_size > buf.len() {
         return Vec::new(); // 数据在两次调用间变化，宁可放弃也不越界
     }
 
+    // 在同一快照上用探针句柄测定 File 类型索引
+    let Some(file_index) = file_type_index_in(&buf, count, entry_size) else {
+        return Vec::new();
+    };
+
     let me = unsafe { GetCurrentProcess() };
     let mut found: HashSet<u32> = HashSet::new();
-    let mut opened: HashSet<u32> = HashSet::new();
+    // 仅缓存"打开进程失败"的 pid（无权限等），避免对同一失败 pid 反复 OpenProcess；
+    // 不能缓存成功打开的 pid——同一进程有多个句柄，第一个未必是目标文件
+    let mut open_failed: HashSet<u32> = HashSet::new();
     let mut name_buf = [0u16; 1024];
 
     for i in 0..count {
@@ -167,13 +246,12 @@ pub fn scan(path: &Path) -> Vec<u32> {
         if found.contains(&pid) {
             continue;
         }
-
-        // 复制句柄前先尝试打开目标进程（按 pid 缓存失败结果避免重复开销）
-        if opened.contains(&pid) {
+        if open_failed.contains(&pid) {
             continue;
         }
-        opened.insert(pid);
+
         let Ok(proc) = (unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }) else {
+            open_failed.insert(pid);
             continue;
         };
 
