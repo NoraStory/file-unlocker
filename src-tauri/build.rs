@@ -2,6 +2,23 @@ fn main() {
     // 自定义 app.manifest：强制以管理员权限（requireAdministrator）启动，
     // 这样结束被系统/其他提权进程占用的文件时才不会被拒绝。
     // 如需改为普通权限启动，把 level 换成 "asInvoker" 并重新编译即可。
+    //
+    // 注意：必须保留 Microsoft.Windows.Common-Controls v6 依赖——
+    // Tauri 运行时会调用 TaskDialogIndirect（comctl32 v6），缺失时
+    // 程序启动即报"无法定位程序输入点 TaskDialogIndirect"。
+    const COMCTL_DEP: &str = r#"  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>"#;
+
     const MANIFEST_ADMIN: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -17,12 +34,12 @@ fn main() {
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
     </application>
   </compatibility>
-</assembly>"#;
+"#;
 
     // 测试二进制不注入提权 manifest：cargo test 需要在普通终端 / CI 中运行。
     // 注意：tauri-build → embed-resource 会把资源（含 manifest）以
     // rustc-link-arg-bins 链接到本 crate 的 *bin* 测试 harness（无法绕过），
-    // 因此运行测试请用 `cargo test --lib`（全部 12 个测试都在 lib 中，
+    // 因此运行测试请用 `cargo test --lib`（全部测试都在 lib 中，
     // main.rs 仅有 3 行启动代码，无可测逻辑）。
     const MANIFEST_TEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -31,7 +48,7 @@ fn main() {
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
     </application>
   </compatibility>
-</assembly>"#;
+"#;
 
     // PROFILE 由 cargo 传给 build script：dev/release 为主程序构建，test 为测试构建
     let manifest = match std::env::var("PROFILE").as_deref() {
@@ -39,9 +56,13 @@ fn main() {
         _ => MANIFEST_ADMIN,
     };
 
+    let mut full = manifest.to_string();
+    full.push_str(COMCTL_DEP);
+    full.push_str("\n</assembly>");
+
     tauri_build::try_build(
         tauri_build::Attributes::new()
-            .windows_attributes(tauri_build::WindowsAttributes::new().app_manifest(manifest)),
+            .windows_attributes(tauri_build::WindowsAttributes::new().app_manifest(full)),
     )
     .expect("failed to run tauri-build");
 }
