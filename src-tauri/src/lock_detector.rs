@@ -144,8 +144,10 @@ fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> 
 /// 单文件模式不产生进度事件。
 pub fn get_locking_processes(
     file_path: &str,
-    on_progress: &dyn Fn(usize, usize),
+    on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<ProcessInfo>, String> {
+    let started = std::time::Instant::now();
+    log::info!("[检测] 目标: {file_path}");
     // 输入校验：前端传来的路径必须真实存在，避免下游错误难排查
     if file_path.is_empty() {
         return Err("文件路径为空".into());
@@ -156,11 +158,20 @@ pub fn get_locking_processes(
     }
 
     // 目录模式：枚举内部文件逐个检测后按 PID 聚合
-    if path.is_dir() {
-        return scan_directory(path, on_progress);
+    let result = if path.is_dir() {
+        scan_directory(path, on_progress)
+    } else {
+        scan_single_file(file_path)
+    };
+    match &result {
+        Ok(list) => log::info!(
+            "[检测] 完成: {} 个占用进程，耗时 {:?}",
+            list.len(),
+            started.elapsed()
+        ),
+        Err(e) => log::warn!("[检测] 失败: {e}，耗时 {:?}", started.elapsed()),
     }
-
-    scan_single_file(file_path)
+    result
 }
 
 /// 文件夹模式：递归枚举目录内文件，检测每个文件的占用者并按 PID 聚合。
@@ -169,7 +180,7 @@ pub fn get_locking_processes(
 /// 所以必须展开到文件粒度。为控制耗时限制最大扫描文件数。
 fn scan_directory(
     dir: &Path,
-    on_progress: &dyn Fn(usize, usize),
+    on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<ProcessInfo>, String> {
     const MAX_FILES: usize = 2000;
 
@@ -435,6 +446,7 @@ fn scan_single_file(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
 /// 发出终止请求后等待最多 3 秒确认进程真正退出；
 /// "进程不存在" 视为已结束（目标早已退出是合法的成功场景）。
 pub fn kill_process(pid: u32) -> Result<(), String> {
+    log::info!("[结束进程] pid={pid}");
     if pid == 0 {
         return Err("无效的进程 ID".into());
     }
@@ -598,6 +610,7 @@ fn descendants_still_alive(ancestor_pid: u32) -> Option<Vec<u32>> {
 /// 通过 NtQuerySystemInformation 的进程快照以 ParentProcessId 归组，
 /// 递归收集指定 pid 的全部后代后逐个 TerminateProcess。
 pub fn kill_process_tree(pid: u32) -> Result<(), String> {
+    log::info!("[结束进程树] 根 pid={pid}");
     let parents = build_parent_map()?;
 
     // BFS 收集后代（含自身）；过滤会造成自伤的目标

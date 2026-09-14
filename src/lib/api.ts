@@ -115,3 +115,51 @@ export async function pickFile(): Promise<string | null> {
     throw new Error(`打开文件选择器失败：${toErrorMessage(e)}`);
   }
 }
+
+/** 自检结果条目 */
+export interface DiagItem {
+  name: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+}
+
+/** 更新信息 */
+export interface UpdateInfo {
+  version: string;
+  notes: string;
+  assets: Array<{ name: string; kind: string; url: string; sha256: string }>;
+  source: string;
+}
+
+/** 运行自检 */
+export async function runDiagnostics(): Promise<DiagItem[]> {
+  try {
+    const list = await invoke<DiagItem[]>("run_diagnostics");
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    return [
+      { name: "自检执行", status: "fail", detail: toErrorMessage(e) },
+    ];
+  }
+}
+
+/** 检查更新（GitHub → Gitee） */
+export async function checkUpdate(): Promise<UpdateInfo | null> {
+  try {
+    return await invoke<UpdateInfo | null>("check_update");
+  } catch (e) {
+    console.error("check_update 失败:", toErrorMessage(e));
+    return null;
+  }
+}
+
+/** 下载并安装更新（后端校验 SHA256 后启动安装器并退出本程序） */
+export async function downloadUpdate(
+  asset: UpdateInfo["assets"][number],
+): Promise<void> {
+  try {
+    await invoke<void>("download_update", { asset });
+  } catch (e) {
+    throw new Error(toErrorMessage(e));
+  }
+}

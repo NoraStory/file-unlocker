@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { fly, fade } from "svelte/transition";
   import { listen } from "@tauri-apps/api/event";
+  import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     getLockingProcesses,
@@ -11,7 +12,12 @@
     deleteFileOnReboot,
     takePendingFile,
     pickFile,
+    runDiagnostics,
+    checkUpdate,
+    downloadUpdate,
     toErrorMessage,
+    type DiagItem,
+    type UpdateInfo,
   } from "./lib/api";
   import type { ProcessInfo } from "./lib/types";
 
@@ -26,6 +32,20 @@
   let fileNotice = $state<string | null>(null);
   /** 当前目标是文件夹（右键菜单支持文件夹入口） */
   let isDirectory = $state(false);
+
+  /** 自检面板 */
+  let diagOpen = $state(false);
+  let diagRunning = $state(false);
+  let diagItems = $state<DiagItem[]>([]);
+  /** 更新 */
+  let updateInfo = $state<UpdateInfo | null>(null);
+  let updateOpen = $state(false);
+  let updateChecking = $state(false);
+  let updateDownloading = $state(false);
+  let updateProgress = $state<{ done: number; total: number } | null>(null);
+  let updateError = $state<string | null>(null);
+  /** 当前版本（启动时注入） */
+  let appVersion = $state("");
 
   /** 全局互斥：任一后端操作进行中时，其它操作按钮全部禁用 */
   let busy = $derived(scanning || killingPid !== null || fileActionBusy !== "");
@@ -134,6 +154,67 @@
     }
   }
 
+  /** 打开自检面板并执行诊断 */
+  async function openDiagnostics() {
+    diagOpen = true;
+    diagRunning = true;
+    diagItems = [];
+    try {
+      diagItems = await runDiagnostics();
+    } finally {
+      diagRunning = false;
+    }
+  }
+
+  /** 检查更新 */
+  async function checkForUpdates() {
+    updateChecking = true;
+    updateError = null;
+    updateInfo = null;
+    try {
+      const info = await checkUpdate();
+      updateOpen = true;
+      if (info) {
+        updateInfo = info;
+      } else {
+        updateError = "已是最新版本，或更新源暂时不可达";
+      }
+    } finally {
+      updateChecking = false;
+    }
+  }
+
+  /** 下载并安装更新 */
+  async function doDownloadUpdate() {
+    if (!updateInfo || updateDownloading) return;
+    const installer = updateInfo.assets.find((a) => a.kind === "installer")
+      ?? updateInfo.assets[0];
+    if (!installer) {
+      updateError = "更新清单中没有可安装的资产";
+      return;
+    }
+    updateDownloading = true;
+    updateError = null;
+    updateProgress = { done: 0, total: 0 };
+    try {
+      await downloadUpdate(installer);
+      // 后端启动安装器后会退出本进程，此行为不可达
+    } catch (e) {
+      updateError = toErrorMessage(e);
+      updateDownloading = false;
+      updateProgress = null;
+    }
+  }
+
+  /** 版本号：从后端 manifest 读取 */
+  async function fetchVersion() {
+    try {
+      appVersion = await invoke<string>("app_version");
+    } catch {
+      appVersion = "";
+    }
+  }
+
   onMount(() => {
     (async () => {
       // 右键菜单 / 二次启动传入的新文件路径
@@ -150,6 +231,24 @@
           scanProgress = { done, total };
         }),
       );
+
+      // 启动静默检查发现新版本
+      unlisteners.push(
+        await listen<UpdateInfo>("update-available", (e) => {
+          updateInfo = e.payload;
+          updateOpen = true;
+        }),
+      );
+
+      // 更新下载进度
+      unlisteners.push(
+        await listen<[number, number]>("update-progress", (e) => {
+          const [done, total] = e.payload;
+          updateProgress = { done, total };
+        }),
+      );
+
+      fetchVersion();
 
       // Tauri 原生拖拽：拿到的是真实文件系统路径
       unlisteners.push(
@@ -195,13 +294,137 @@
         <path d="M8 11V7a4 4 0 0 1 7.5-2" />
       </svg>
     </div>
-    <div>
-      <h1 class="text-base font-semibold leading-tight">文件占用解除</h1>
+    <div class="min-w-0 flex-1">
+      <h1 class="text-base font-semibold leading-tight">
+        文件占用解除
+        {#if appVersion}
+          <span class="dim ml-1 text-xs font-normal">v{appVersion}</span>
+        {/if}
+      </h1>
       <p class="dim text-xs leading-tight">
         检测并结束锁定文件的进程 · 拖入文件或通过右键菜单启动
       </p>
     </div>
+    <div class="flex shrink-0 items-center gap-1.5">
+      {#if updateInfo}
+        <button
+          class="rounded-md px-2 py-1 text-xs font-medium transition hover:opacity-80 active:scale-95"
+          style="background: var(--ok); color: #fff;"
+          onclick={() => (updateOpen = true)}
+          title="发现新版本 v{updateInfo.version}，点击查看"
+        >新版本</button>
+      {/if}
+      <button
+        class="rounded-md px-2 py-1 text-xs transition hover:opacity-80 active:scale-95"
+        style="background: var(--stroke);"
+        onclick={checkForUpdates}
+        disabled={updateChecking}
+      >{updateChecking ? "检查中…" : "检查更新"}</button>
+      <button
+        class="rounded-md px-2 py-1 text-xs transition hover:opacity-80 active:scale-95"
+        style="background: var(--stroke);"
+        onclick={openDiagnostics}
+        title="检测权限、检测引擎、右键菜单等运行前提"
+      >自检</button>
+    </div>
   </header>
+
+  <!-- 自检面板 -->
+  {#if diagOpen}
+    <div
+      class="card flex max-h-64 flex-col overflow-hidden"
+      in:fade={{ duration: 150 }}
+      style="border-color: var(--stroke-strong);"
+    >
+      <div class="flex items-center justify-between border-b px-4 py-2.5" style="border-color: var(--stroke);">
+        <span class="text-sm font-medium">运行自检</span>
+        <div class="flex items-center gap-2">
+          <button
+            class="rounded-md px-2 py-1 text-xs transition hover:opacity-80 active:scale-95"
+            style="background: var(--stroke);"
+            disabled={diagRunning}
+            onclick={openDiagnostics}
+          >重新检测</button>
+          <button
+            class="dim rounded-md px-2 py-1 text-xs transition hover:opacity-80"
+            onclick={() => (diagOpen = false)}
+          >关闭</button>
+        </div>
+      </div>
+      <div class="min-h-0 flex-1 overflow-y-auto p-2.5">
+        {#if diagRunning}
+          <div class="dim py-6 text-center text-xs">检测中…</div>
+        {:else}
+          <ul class="flex flex-col gap-1.5">
+            {#each diagItems as item (item.name)}
+              <li class="flex items-start gap-2 rounded-md px-2 py-1.5 text-xs" style="background: var(--glass-strong);">
+                <span
+                  class="mt-px shrink-0"
+                  style="color: {item.status === 'ok' ? 'var(--ok)' : item.status === 'warn' ? '#d48a00' : 'var(--danger)'};"
+                >{item.status === "ok" ? "✓" : item.status === "warn" ? "!" : "✕"}</span>
+                <div class="min-w-0">
+                  <div class="font-medium">{item.name}</div>
+                  <div class="dim break-all">{item.detail}</div>
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  <!-- 更新面板 -->
+  {#if updateOpen}
+    <div
+      class="card flex flex-col overflow-hidden"
+      in:fade={{ duration: 150 }}
+      style="border-color: var(--stroke-strong);"
+    >
+      <div class="flex items-center justify-between border-b px-4 py-2.5" style="border-color: var(--stroke);">
+        <span class="text-sm font-medium">软件更新</span>
+        <button
+          class="dim rounded-md px-2 py-1 text-xs transition hover:opacity-80"
+          onclick={() => (updateOpen = false)}
+        >关闭</button>
+      </div>
+      <div class="flex flex-col gap-2 p-4">
+        {#if updateInfo}
+          <div class="text-sm">
+            发现新版本 <span class="font-semibold">v{updateInfo.version}</span>
+            <span class="dim text-xs">（来源：{updateInfo.source}，当前 v{appVersion || "?"}）</span>
+          </div>
+          {#if updateInfo.notes}
+            <div class="dim max-h-24 overflow-y-auto whitespace-pre-wrap rounded-md p-2 text-xs" style="background: var(--glass-strong);">{updateInfo.notes}</div>
+          {/if}
+          {#if updateProgress}
+            <div class="w-full">
+              <div class="h-1.5 w-full overflow-hidden rounded-full" style="background: var(--stroke);">
+                <div
+                  class="h-full rounded-full transition-all duration-150"
+                  style="width: {updateProgress.total > 0 ? Math.round((updateProgress.done / updateProgress.total) * 100) : 20}%; background: var(--accent);"
+                ></div>
+              </div>
+              <div class="dim mt-1 text-center text-xs">
+                下载中 {updateProgress.total > 0 ? `${Math.round(updateProgress.done / 1048576)} / ${Math.round(updateProgress.total / 1048576)} MB` : `${Math.round(updateProgress.done / 1048576)} MB`}
+              </div>
+            </div>
+          {:else}
+            <button
+              class="accent-btn px-3 py-2 text-sm font-medium disabled:opacity-50"
+              disabled={updateDownloading}
+              onclick={doDownloadUpdate}
+            >{updateDownloading ? "准备下载…" : "下载并安装"}</button>
+          {/if}
+        {:else}
+          <div class="dim text-sm">{updateError || "正在查询…"}</div>
+        {/if}
+        {#if updateError}
+          <div class="text-xs" style="color: var(--danger);">{updateError}</div>
+        {/if}
+      </div>
+    </div>
+  {/if}
 
   <!-- 拖拽 / 文件选择区 -->
   <div

@@ -3,9 +3,11 @@ use std::sync::Mutex;
 use lock_detector::ProcessInfo;
 use tauri::{Emitter, Manager, State};
 
+mod diagnostics;
 mod file_actions;
 mod handle_scan;
 mod lock_detector;
+mod updater;
 mod winutil;
 
 /// 启动参数中携带、等待前端取走的文件路径。
@@ -96,13 +98,75 @@ fn take_pending_file(state: State<'_, PendingFile>) -> Option<String> {
     state.0.lock().unwrap().take()
 }
 
+/// 当前版本号
+#[tauri::command]
+fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// 自检：检测权限、检测引擎、右键菜单、日志等必要前提
+#[tauri::command]
+async fn run_diagnostics() -> Vec<diagnostics::DiagItem> {
+    log::info!("[自检] 开始");
+    tauri::async_runtime::spawn_blocking(diagnostics::run_diagnostics)
+        .await
+        .unwrap_or_default()
+}
+
+/// 检查更新（GitHub → Gitee 依次尝试）
+#[tauri::command]
+async fn check_update(
+    app: tauri::AppHandle,
+) -> Option<updater::UpdateInfo> {
+    let current = app.package_info().version.to_string();
+    log::info!("[更新] 手动检查，当前版本 {current}");
+    tauri::async_runtime::spawn_blocking(move || updater::check_for_update(&current))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 下载更新安装包（SHA256 校验后启动安装器）
+#[tauri::command]
+async fn download_update(
+    window: tauri::Window<tauri::Wry>,
+    asset: updater::UpdateAsset,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let on_progress = |done: u64, total: u64| {
+            let _ = window.emit("update-progress", (done, total));
+        };
+        let path = updater::download_asset(&asset, &on_progress)?;
+        log::info!("[更新] 安装包已就绪: {}", path.display());
+        updater::launch_installer(&path)
+    })
+    .await
+    .map_err(|e| format!("后台任务异常：{e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // panic 兜底：写日志（logger 未就绪时至少进 stderr，便于崩溃排查）
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {info}");
+        log::error!("{msg}");
+        eprintln!("{msg}");
+    }));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // 文件日志：轮转保留 10 个 × 1MB，写入系统日志目录
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .max_file_size(1_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                .build(),
+        )
         // 单实例：资源管理器里连续右键多个文件时，不开新窗口，
         // 而是把新路径转发给已存在的窗口
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            log::info!("[单实例] 二次启动参数: {argv:?}");
             if let Some(path) = extract_path_from_args(&argv) {
                 push_file(app, path);
             } else if let Some(window) = app.get_webview_window("main") {
@@ -116,18 +180,37 @@ pub fn run() {
             kill_process_tree,
             delete_file,
             delete_file_on_reboot,
-            take_pending_file
+            take_pending_file,
+            app_version,
+            run_diagnostics,
+            check_update,
+            download_update
         ])
         .setup(|app| {
+            log::info!(
+                "[启动] FileUnlocker v{} (win {})",
+                app.package_info().version,
+                std::env::consts::OS
+            );
             // 首次启动即带路径参数（右键菜单 "%1"）时，交给前端
             let args: Vec<String> = std::env::args().collect();
             if let Some(path) = extract_path_from_args(&args) {
+                log::info!("[启动] 携带文件参数: {path}");
                 app.state::<PendingFile>()
                     .0
                     .lock()
                     .unwrap()
                     .replace(path);
             }
+            // 启动后静默检查更新（非阻塞）
+            let handle = app.handle().clone();
+            let current = app.package_info().version.to_string();
+            tauri::async_runtime::spawn(async move {
+                if let Some(info) = updater::check_for_update(&current) {
+                    log::info!("[更新] 发现新版本 {}", info.version);
+                    let _ = handle.emit("update-available", info);
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
