@@ -1,18 +1,18 @@
 {
-  "version": "0.3.2",
-  "notes": "FileUnlocker 0.3.2 更新",
+  "version": "0.3.3",
+  "notes": "修复自检探针文件冲突导致的 os error 32",
   "assets": [
     {
-      "name": "FileUnlocker_0.3.2_x64-setup.exe",
+      "name": "FileUnlocker_0.3.3_x64-setup.exe",
       "kind": "installer",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.2/FileUnlocker_0.3.2_x64-setup.exe",
-      "sha256": "55d5a227a55b5acaf884de5840240b3510456fd39008950baa6caf01345ff069"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.3/FileUnlocker_0.3.3_x64-setup.exe",
+      "sha256": "f817fa6766ac8d911a1620976dfe6acb494f73f32098d6d7300add2df0c2fa74"
     },
     {
       "name": "file-unlocker.exe",
       "kind": "portable",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.2/file-unlocker.exe",
-      "sha256": "e16269c9e730e3485e381d3425e3d26911b6a4e38293a580e4146f1aa8b0ece9"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.3/file-unlocker.exe",
+      "sha256": "2bc9f799304612a6b150a6ff82686df08a8ce9f9bf4db37935dc55aea70d200f"
     }
   ]
 }
