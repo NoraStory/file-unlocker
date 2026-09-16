@@ -93,7 +93,6 @@ fn check_debug_privilege() -> DiagItem {
 
 /// 3. Restart Manager 可用性（本机可能遇到 RM 服务异常，仅降级不致命）
 fn check_restart_manager() -> DiagItem {
-    use std::os::windows::fs::OpenOptionsExt;
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows::Win32::System::RestartManager::{
@@ -101,20 +100,13 @@ fn check_restart_manager() -> DiagItem {
         RM_PROCESS_INFO,
     };
 
-    // 探针文件：create(true) 一步创建并独占打开，失败带完整 OS 错误入日志
-    let probe = std::env::temp_dir().join(format!("fu_diag_{}.tmp", std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .share_mode(0) // 独占，模拟真实占用
-        .open(&probe);
-    let Ok(_file) = file else {
-        let e = file.unwrap_err();
-        log::warn!("[自检] Restart Manager 探针文件创建失败: {e}");
-        let _ = std::fs::remove_file(&probe);
-        return warn("Restart Manager", format!("探针文件创建失败：{e}"));
+    // 探针文件：每次创建全新路径并独占打开，避免进程 ID 复用/并发自检时的 os error 32
+    let (probe, _file) = match crate::probe_utils::create_probe(&std::env::temp_dir(), "fu_diag") {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[自检] Restart Manager 探针文件创建失败: {e}");
+            return warn("Restart Manager", format!("探针文件创建失败：{e}"));
+        }
     };
     let wide = crate::winutil::to_wide(&probe.to_string_lossy());
 
@@ -157,20 +149,12 @@ fn check_restart_manager() -> DiagItem {
 
 /// 4. 句柄扫描引擎（核心检测引擎，必须工作）
 fn check_handle_scan() -> DiagItem {
-    use std::os::windows::fs::OpenOptionsExt;
-    let probe = std::env::temp_dir().join(format!("fu_diag_scan_{}.tmp", std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .share_mode(0)
-        .open(&probe);
-    let Ok(file) = file else {
-        let e = file.unwrap_err();
-        log::warn!("[自检] 句柄扫描探针文件创建失败: {e}");
-        let _ = std::fs::remove_file(&probe);
-        return fail("句柄扫描引擎", format!("探针文件创建失败：{e}"));
+    let (probe, file) = match crate::probe_utils::create_probe(&std::env::temp_dir(), "fu_diag_scan") {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[自检] 句柄扫描探针文件创建失败: {e}");
+            return fail("句柄扫描引擎", format!("探针文件创建失败：{e}"));
+        }
     };
 
     let pids = match crate::handle_scan::scan(&probe) {

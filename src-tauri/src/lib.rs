@@ -5,6 +5,7 @@ use tauri::{Emitter, Manager, State};
 
 mod diagnostics;
 mod file_actions;
+mod probe_utils;
 mod handle_scan;
 mod lock_detector;
 mod updater;
