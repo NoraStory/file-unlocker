@@ -7,12 +7,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 
-#[path = "../src/winutil.rs"]
-mod winutil;
 #[path = "../src/handle_scan.rs"]
 mod handle_scan;
 #[path = "../src/lock_detector.rs"]
 mod lock_detector;
+#[path = "../src/winutil.rs"]
+mod winutil;
 
 use lock_detector::get_locking_processes;
 
@@ -22,19 +22,25 @@ fn main() {
     assert!(target_path.exists(), "目标不存在: {target}");
 
     // 1. 空路径必须报错，不得返回“无占用”
-    let empty = get_locking_processes("", &|_, _| {});
+    let empty = get_locking_processes("", std::sync::Arc::new(|_, _| {}));
     assert!(empty.is_err(), "空路径应报错");
 
     // 2. 不存在路径必须报错
-    let missing = get_locking_processes(r"C:\__file_unlocker_missing__.tmp", &|_, _| {});
+    let missing = get_locking_processes(
+        r"C:\__file_unlocker_missing__.tmp",
+        std::sync::Arc::new(|_, _| {}),
+    );
     assert!(missing.is_err(), "不存在路径应报错");
 
     // 3. 真实目录基线扫描：应完成且不 panic；记录文件数与当前占用
-    let outcome = get_locking_processes(&target, &|done, total| {
-        if total > 0 && done % ((total / 10).max(1)) == 0 {
-            println!("progress {done}/{total}");
-        }
-    })
+    let outcome = get_locking_processes(
+        &target,
+        std::sync::Arc::new(|done, total| {
+            if total > 0 && done % ((total / 10).max(1)) == 0 {
+                println!("progress {done}/{total}");
+            }
+        }),
+    )
     .unwrap_or_else(|e| panic!("目录扫描失败: {e}"));
     println!(
         "baseline files={} locks={} truncated={}",
@@ -55,7 +61,7 @@ fn main() {
         .expect("打开探针失败");
     writeln!(locked, "locked").unwrap();
 
-    let outcome_locked = get_locking_processes(&target, &|_, _| {})
+    let outcome_locked = get_locking_processes(&target, std::sync::Arc::new(|_, _| {}))
         .unwrap_or_else(|e| panic!("锁定目录扫描失败: {e}"));
     let me = std::process::id();
     let hit = outcome_locked
@@ -69,15 +75,19 @@ fn main() {
     );
 
     // 5. 单文件扫描也应命中
-    let single = get_locking_processes(&probe.to_string_lossy(), &|_, _| {})
+    let single = get_locking_processes(&probe.to_string_lossy(), std::sync::Arc::new(|_, _| {}))
         .unwrap_or_else(|e| panic!("单文件扫描失败: {e}"));
     assert!(single.processes.iter().any(|p| p.pid == me));
 
     // 6. 清理探针
     drop(locked);
     std::fs::remove_file(&probe).expect("清理探针失败");
-    let cleaned = get_locking_processes(&target, &|_, _| {})
+    let cleaned = get_locking_processes(&target, std::sync::Arc::new(|_, _| {}))
         .unwrap_or_else(|e| panic!("清理后目录扫描失败: {e}"));
-    println!("cleanup files={} locks={}", cleaned.file_count, cleaned.processes.len());
+    println!(
+        "cleanup files={} locks={}",
+        cleaned.file_count,
+        cleaned.processes.len()
+    );
     println!("path-probe PASS");
 }

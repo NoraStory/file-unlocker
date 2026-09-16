@@ -12,13 +12,25 @@ pub struct DiagItem {
 }
 
 fn ok(name: &str, detail: impl Into<String>) -> DiagItem {
-    DiagItem { name: name.into(), status: "ok".into(), detail: detail.into() }
+    DiagItem {
+        name: name.into(),
+        status: "ok".into(),
+        detail: detail.into(),
+    }
 }
 fn warn(name: &str, detail: impl Into<String>) -> DiagItem {
-    DiagItem { name: name.into(), status: "warn".into(), detail: detail.into() }
+    DiagItem {
+        name: name.into(),
+        status: "warn".into(),
+        detail: detail.into(),
+    }
 }
 fn fail(name: &str, detail: impl Into<String>) -> DiagItem {
-    DiagItem { name: name.into(), status: "fail".into(), detail: detail.into() }
+    DiagItem {
+        name: name.into(),
+        status: "fail".into(),
+        detail: detail.into(),
+    }
 }
 
 /// 执行全部自检项
@@ -49,9 +61,12 @@ fn check_admin() -> DiagItem {
 
 /// 2. SeDebugPrivilege（枚举 SYSTEM 进程句柄的前提）
 fn check_debug_privilege() -> DiagItem {
-    use windows::Win32::Security::{PrivilegeCheck, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, LUID_AND_ATTRIBUTES, PRIVILEGE_SET, TOKEN_QUERY};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows::Win32::Security::{
+        PrivilegeCheck, LUID_AND_ATTRIBUTES, PRIVILEGE_SET, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+        TOKEN_QUERY,
+    };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::Win32::Foundation::{LUID, CloseHandle, HANDLE};
 
     unsafe {
         let mut token = HANDLE::default();
@@ -100,15 +115,15 @@ fn check_restart_manager() -> DiagItem {
         RM_PROCESS_INFO,
     };
 
-    // 探针文件：每次创建全新路径并独占打开，避免进程 ID 复用/并发自检时的 os error 32
-    let (probe, _file) = match crate::probe_utils::create_probe(&std::env::temp_dir(), "fu_diag") {
+    // 探针文件：每次创建全新路径并独占打开，RAII 自动清理，避免残留和 os error 32
+    let probe = match crate::probe_utils::ProbeFile::create(&std::env::temp_dir(), "fu_diag") {
         Ok(v) => v,
         Err(e) => {
             log::warn!("[自检] Restart Manager 探针文件创建失败: {e}");
             return warn("Restart Manager", format!("探针文件创建失败：{e}"));
         }
     };
-    let wide = crate::winutil::to_wide(&probe.to_string_lossy());
+    let wide = crate::winutil::to_wide(&probe.path().to_string_lossy());
 
     let result = unsafe {
         let mut handle = 0u32;
@@ -117,12 +132,8 @@ fn check_restart_manager() -> DiagItem {
             // 不提前 return：否则下面的探针文件清理不会执行，临时目录残留垃圾
             fail("Restart Manager", "RmStartSession 失败：服务不可用")
         } else {
-            let outcome = if RmRegisterResources(
-                handle,
-                Some(&[PCWSTR(wide.as_ptr())]),
-                None,
-                None,
-            ) != ERROR_SUCCESS
+            let outcome = if RmRegisterResources(handle, Some(&[PCWSTR(wide.as_ptr())]), None, None)
+                != ERROR_SUCCESS
             {
                 fail("Restart Manager", "RmRegisterResources 失败")
             } else {
@@ -142,14 +153,13 @@ fn check_restart_manager() -> DiagItem {
             outcome
         }
     };
-    drop(_file);
-    let _ = std::fs::remove_file(&probe);
+    drop(probe);
     result
 }
 
 /// 4. 句柄扫描引擎（核心检测引擎，必须工作）
 fn check_handle_scan() -> DiagItem {
-    let (probe, file) = match crate::probe_utils::create_probe(&std::env::temp_dir(), "fu_diag_scan") {
+    let probe = match crate::probe_utils::ProbeFile::create(&std::env::temp_dir(), "fu_diag_scan") {
         Ok(v) => v,
         Err(e) => {
             log::warn!("[自检] 句柄扫描探针文件创建失败: {e}");
@@ -157,17 +167,13 @@ fn check_handle_scan() -> DiagItem {
         }
     };
 
-    let pids = match crate::handle_scan::scan(&probe) {
+    let pids = match crate::handle_scan::scan(probe.path()) {
         Ok(pids) => pids,
         Err(e) => {
-            drop(file);
-            let _ = std::fs::remove_file(&probe);
             log::warn!("[自检] 句柄扫描引擎失效: {e}");
             return fail("句柄扫描引擎", format!("扫描引擎失效：{e}"));
         }
     };
-    drop(file);
-    let _ = std::fs::remove_file(&probe);
 
     if pids.contains(&std::process::id()) {
         ok("句柄扫描引擎", "正常（成功检出本进程占用的探针文件）")
@@ -186,7 +192,10 @@ fn check_context_menu() -> DiagItem {
         .output();
     match output {
         Ok(o) if o.status.success() => ok("右键菜单", "已注册"),
-        Ok(_) => warn("右键菜单", "未注册（运行 scripts\\register-context-menu.bat 可注册）"),
+        Ok(_) => warn(
+            "右键菜单",
+            "未注册（运行 scripts\\register-context-menu.bat 可注册）",
+        ),
         Err(e) => warn("右键菜单", format!("无法查询注册表：{e}")),
     }
 }
@@ -206,7 +215,10 @@ fn check_log_writable(app: &tauri::AppHandle) -> DiagItem {
             let _ = std::fs::remove_file(&probe);
             ok("日志写入", format!("可写（日志目录：{}）", dir.display()))
         }
-        Err(e) => warn("日志写入", format!("日志目录写入失败：{e}（{}）", dir.display())),
+        Err(e) => warn(
+            "日志写入",
+            format!("日志目录写入失败：{e}（{}）", dir.display()),
+        ),
     }
 }
 
@@ -214,7 +226,12 @@ fn check_log_writable(app: &tauri::AppHandle) -> DiagItem {
 fn check_os_version() -> DiagItem {
     let get = |key: &str| -> Option<String> {
         let output = std::process::Command::new("reg")
-            .args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "/v", key])
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                "/v",
+                key,
+            ])
             .output()
             .ok()?;
         if !output.status.success() {

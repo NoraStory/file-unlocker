@@ -14,7 +14,7 @@ static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 旧版使用 `进程 ID + 固定文件名`，进程 ID 复用时可能撞上残留探针
 /// （或安全软件的短时扫描句柄），导致 os error 32。这里每次都用
 /// `create_new` 生成新路径，避免与历史文件或并发自检冲突。
-pub fn create_probe(dir: &Path, prefix: &str) -> io::Result<(PathBuf, File)> {
+pub(crate) fn create_probe(dir: &Path, prefix: &str) -> io::Result<(PathBuf, File)> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
@@ -35,6 +35,8 @@ pub fn create_probe(dir: &Path, prefix: &str) -> io::Result<(PathBuf, File)> {
             .read(true)
             .write(true)
             .share_mode(0)
+            // 句柄关闭/进程异常退出时由内核自动删除，避免自检崩溃后残留探针
+            .custom_flags(0x0400_0000) // FILE_FLAG_DELETE_ON_CLOSE
             .open(&path)
         {
             Ok(file) => return Ok((path, file)),
@@ -54,18 +56,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_paths_are_unique() {
+    fn probe_paths_are_unique_and_cleaned() {
         let dir = std::env::temp_dir();
-        let (path1, file1) = create_probe(&dir, "fu_probe_test").unwrap();
-        let (path2, file2) = create_probe(&dir, "fu_probe_test").unwrap();
+        let probe1 = ProbeFile::create(&dir, "fu_probe_test").unwrap();
+        let probe2 = ProbeFile::create(&dir, "fu_probe_test").unwrap();
 
-        assert_ne!(path1, path2);
-        assert!(path1.exists());
-        assert!(path2.exists());
+        assert_ne!(probe1.path(), probe2.path());
+        assert!(probe1.path().exists());
+        assert!(probe2.path().exists());
 
-        drop(file1);
-        drop(file2);
-        let _ = std::fs::remove_file(&path1);
-        let _ = std::fs::remove_file(&path2);
+        let path1 = probe1.path().to_path_buf();
+        let path2 = probe2.path().to_path_buf();
+        drop(probe1);
+        drop(probe2);
+
+        assert!(!path1.exists());
+        assert!(!path2.exists());
+    }
+}
+
+/// 探针文件 RAII：Drop 时先释放句柄再删除文件，
+/// 自检中途失败/早退也不会在临时目录残留垃圾。
+pub(crate) struct ProbeFile {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl ProbeFile {
+    pub(crate) fn create(dir: &Path, prefix: &str) -> io::Result<Self> {
+        let (path, file) = create_probe(dir, prefix)?;
+        Ok(Self {
+            path,
+            file: Some(file),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ProbeFile {
+    fn drop(&mut self) {
+        // 必须先 drop 内部句柄再删除，否则独占打开时删除失败
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl std::ops::Deref for ProbeFile {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        self.file.as_ref().expect("probe file is alive")
+    }
+}
+
+impl std::ops::DerefMut for ProbeFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.file.as_mut().expect("probe file is alive")
     }
 }

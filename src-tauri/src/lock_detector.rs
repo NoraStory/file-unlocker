@@ -23,8 +23,8 @@ use windows::Win32::System::RestartManager::{
     RM_PROCESS_INFO,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 use crate::handle_scan;
@@ -166,7 +166,7 @@ fn query_restart_manager(file_path: &str) -> Result<Vec<(u32, String)>, String> 
 /// 单文件模式不产生进度事件。
 pub fn get_locking_processes(
     file_path: &str,
-    on_progress: &(dyn Fn(usize, usize) + Sync),
+    on_progress: crate::handle_scan::ProgressCallback,
 ) -> Result<ScanOutcome, String> {
     let started = std::time::Instant::now();
     log::info!("[检测] 目标: {file_path}");
@@ -211,7 +211,7 @@ pub fn get_locking_processes(
 /// 所以必须展开到文件粒度。为控制耗时限制最大扫描文件数。
 fn scan_directory(
     dir: &Path,
-    on_progress: &(dyn Fn(usize, usize) + Sync),
+    on_progress: crate::handle_scan::ProgressCallback,
 ) -> Result<ScanOutcome, String> {
     const MAX_FILES: usize = 2000;
 
@@ -374,9 +374,7 @@ fn query_restart_manager_batch(files: &[std::path::PathBuf]) -> Result<Vec<(u32,
     }
     // 手动管理会话释放（批量路径不走 RAII 守卫，因注册资源数动态）
     let result = (|| -> Result<Vec<(u32, String)>, String> {
-        let err = unsafe {
-            RmRegisterResources(handle, Some(&pcsz), None, None)
-        };
+        let err = unsafe { RmRegisterResources(handle, Some(&pcsz), None, None) };
         if err != ERROR_SUCCESS {
             return Err(format!("RmRegisterResources 失败 (错误码 {})", err.0));
         }
@@ -390,7 +388,11 @@ fn query_restart_manager_batch(files: &[std::path::PathBuf]) -> Result<Vec<(u32,
                     handle,
                     &mut needed,
                     &mut count,
-                    if buf.is_empty() { None } else { Some(buf.as_mut_ptr()) },
+                    if buf.is_empty() {
+                        None
+                    } else {
+                        Some(buf.as_mut_ptr())
+                    },
                     std::ptr::null_mut(),
                 )
             };
@@ -485,7 +487,11 @@ fn scan_single_file(file_path: &str) -> Result<Vec<ProcessInfo>, String> {
     // - RM 失败但句柄扫描正常（部分系统 RM 服务异常）→ 句柄扫描独立兜底
     if merged.is_empty() {
         if let Err(e) = hm_result {
-            let rm_failed = rm_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+            let rm_failed = rm_result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             log::error!("[检测] 双引擎均无结果：句柄扫描={e}；RM={rm_failed}");
             return Err(format!(
                 "检测引擎异常（句柄扫描：{e}；Restart Manager：{rm_failed}）。请运行自检并导出日志反馈"
@@ -613,7 +619,10 @@ fn build_parent_map() -> Result<std::collections::HashMap<u32, Vec<u32>>, String
             continue;
         }
         if status.0 != 0 {
-            return Err(format!("NtQuerySystemInformation 失败 (NTSTATUS 0x{:08x})", status.0));
+            return Err(format!(
+                "NtQuerySystemInformation 失败 (NTSTATUS 0x{:08x})",
+                status.0
+            ));
         }
         buf.truncate(ret as usize);
         break buf;
@@ -665,7 +674,11 @@ fn descendants_still_alive(ancestor_pid: u32) -> Option<Vec<u32>> {
             }
         }
     }
-    if alive.is_empty() { None } else { Some(alive) }
+    if alive.is_empty() {
+        None
+    } else {
+        Some(alive)
+    }
 }
 
 /// 结束进程树：先结束子进程再结束父进程（参照 LockHunter / taskkill /T）。
@@ -708,11 +721,7 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
             if let Some(exe) = process_image_full(p) {
                 // exe 是完整路径（如 C:\Windows\explorer.exe），必须取文件名再比较，
                 // 否则该防护永远命中不了
-                let name = exe
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .unwrap_or("")
-                    .to_lowercase();
+                let name = exe.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase();
                 if name == "explorer.exe" {
                     skipped_explorer.push(p);
                     return false; // 跳过 shell 进程

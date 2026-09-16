@@ -11,12 +11,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 
-#[path = "../src/winutil.rs"]
-mod winutil;
 #[path = "../src/handle_scan.rs"]
 mod handle_scan;
 #[path = "../src/lock_detector.rs"]
 mod lock_detector;
+#[path = "../src/winutil.rs"]
+mod winutil;
 
 fn main() {
     let dir = std::env::temp_dir().join("file_unlocker_e2e");
@@ -37,7 +37,7 @@ fn main() {
     println!("== 锁定文件: {path_str}");
 
     // 1. 双引擎合并检测：无论 RM 在该系统是否可用，句柄扫描保证结果正确
-    match lock_detector::get_locking_processes(&path_str, &|_, _| {}) {
+    match lock_detector::get_locking_processes(&path_str, std::sync::Arc::new(|_, _| {})) {
         Ok(outcome) => {
             let list = &outcome.processes;
             println!("== 检测到 {} 个占用进程", list.len());

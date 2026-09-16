@@ -3,7 +3,14 @@
 //! 复制目标进程的句柄并比对最终路径，找出 Restart Manager 可能漏报的占用进程
 //! （例如 SYSTEM 进程持有的句柄、非标准共享模式的文件句柄等）。
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{
@@ -11,11 +18,19 @@ use windows::Win32::Foundation::{
     STATUS_INFO_LENGTH_MISMATCH,
 };
 use windows::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
 
 use crate::winutil::{enable_debug_privilege, final_path_from_handle};
+
+pub type HitPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync>;
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// SystemExtendedHandleInformation 的信息类别码
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
@@ -65,9 +80,7 @@ fn query_system_info(class: u32, max_len: u32) -> Option<Vec<u8>> {
         if status == STATUS_INFO_LENGTH_MISMATCH {
             let next = if needed > len { needed } else { len * 4 };
             if next > max_len {
-                log::error!(
-                    "[句柄扫描] 快照查询所需缓冲 {next} 字节超过上限 {max_len}"
-                );
+                log::error!("[句柄扫描] 快照查询所需缓冲 {next} 字节超过上限 {max_len}");
                 return None;
             }
             log::debug!(
@@ -100,7 +113,9 @@ fn file_type_index_in(buf: &[u8], count: usize, entry_size: usize) -> Option<u16
 
     for i in 0..count {
         let entry = unsafe {
-            *(buf.as_ptr().add(std::mem::size_of::<HandleInfoHeader>() + i * entry_size)
+            *(buf
+                .as_ptr()
+                .add(std::mem::size_of::<HandleInfoHeader>() + i * entry_size)
                 as *const HandleEntry)
         };
         if entry.process_id != my_pid {
@@ -143,8 +158,8 @@ pub fn bench_scan(path: &std::path::Path) -> Vec<u32> {
 /// 明确区分——上层不得把失效伪装成"文件未被占用"。
 pub fn scan(path: &Path) -> Result<Vec<u32>, String> {
     let target = normalize_path(path);
-    let map =
-        collect_handle_paths_if(&|resolved: &str| resolved.to_lowercase() == target, None)?;
+    let hit: HitPredicate = Arc::new(move |resolved: &str| resolved.to_lowercase() == target);
+    let map = collect_handle_paths_if(hit, None)?;
     Ok(map.into_keys().collect())
 }
 
@@ -157,16 +172,15 @@ pub fn scan(path: &Path) -> Result<Vec<u32>, String> {
 /// 关系，但单调递增、粒度均匀，进度条走势平滑。
 pub fn scan_directory(
     dir: &Path,
-    on_progress: &(dyn Fn(usize, usize) + Sync),
+    on_progress: ProgressCallback,
 ) -> Result<std::collections::HashMap<u32, Vec<String>>, String> {
     let mut prefix = normalize_path(dir);
     if !prefix.ends_with('\\') {
         prefix.push('\\');
     }
-    collect_handle_paths_if(
-        &|resolved: &str| resolved.to_lowercase().starts_with(&prefix),
-        Some(on_progress),
-    )
+    let hit: HitPredicate =
+        Arc::new(move |resolved: &str| resolved.to_lowercase().starts_with(&prefix));
+    collect_handle_paths_if(hit, Some(on_progress))
 }
 
 /// 归一化：剥离 `\\?\` 设备前缀（UNC 还原为 `\\server\share`）后小写。
@@ -196,8 +210,8 @@ unsafe impl Sync for SendHandle {}
 /// 4. 路径解析（DuplicateHandle + GetFinalPathNameByHandleW）多线程并行，
 ///    系统调用是主要开销，CPU 核越多收益越大
 fn collect_handle_paths_if(
-    hit: &(dyn Fn(&str) -> bool + Sync),
-    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    hit: HitPredicate,
+    progress: Option<ProgressCallback>,
 ) -> Result<std::collections::HashMap<u32, Vec<String>>, String> {
     enable_debug_privilege();
 
@@ -218,111 +232,165 @@ fn collect_handle_paths_if(
         .ok_or_else(|| "无法测定文件句柄类型索引（句柄表快照不完整）".to_string())?;
 
     // 收集 File 类型候选句柄（一次纯内存遍历，微秒级）
-    let mut candidates: Vec<(u32, usize, u32)> = Vec::new();
+    let mut candidate_vec: Vec<(u32, usize, u32)> = Vec::new();
     for i in 0..count {
         let entry = unsafe {
-            *(buf.as_ptr().add(std::mem::size_of::<HandleInfoHeader>() + i * entry_size)
+            *(buf
+                .as_ptr()
+                .add(std::mem::size_of::<HandleInfoHeader>() + i * entry_size)
                 as *const HandleEntry)
         };
         let pid = entry.process_id as u32;
         if pid == 0 || entry.object_type_index != file_index || entry.granted_access == 0 {
             continue;
         }
-        candidates.push((pid, entry.handle, entry.granted_access));
+        candidate_vec.push((pid, entry.handle, entry.granted_access));
     }
-    let total_candidates = candidates.len();
+    let total_candidates = candidate_vec.len();
+    let candidates = Arc::new(candidate_vec);
 
-    // 并行解析：进程句柄按 pid 缓存（Mutex），null 表示该 pid 打不开
-    let results: std::sync::Mutex<std::collections::HashMap<u32, Vec<String>>> = Default::default();
-    let proc_cache: std::sync::Mutex<std::collections::HashMap<u32, SendHandle>> =
-        Default::default();
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    // 并行解析：进程句柄按 pid 缓存（Mutex），INVALID_HANDLE_VALUE 表示该 pid 打不开
+    let results: Arc<Mutex<std::collections::HashMap<u32, Vec<String>>>> = Default::default();
+    let proc_cache: Arc<Mutex<std::collections::HashMap<u32, SendHandle>>> = Default::default();
+    let next = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .min(16);
+    let last_progress: Arc<Vec<AtomicU64>> =
+        Arc::new((0..workers).map(|_| AtomicU64::new(now_millis())).collect());
 
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| {
-                loop {
-                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= candidates.len() {
-                        break;
-                    }
-                    if let Some(cb) = progress {
-                        // 每 256 个候选上报一次，频率足以让进度条平滑又不刷屏
-                        if idx % 256 == 0 {
-                            cb(idx, total_candidates);
-                        }
-                    }
-                    let (pid, handle, _granted) = candidates[idx];
+    let mut handles = Vec::with_capacity(workers);
+    for worker_id in 0..workers {
+        let hit = hit.clone();
+        let progress = progress.clone();
+        let candidates = candidates.clone();
+        let results = results.clone();
+        let proc_cache = proc_cache.clone();
+        let next = next.clone();
+        let done = done.clone();
+        let last_progress = last_progress.clone();
 
-                    let proc = {
-                        let mut cache = proc_cache.lock().unwrap();
-                        cache
-                            .entry(pid)
-                            .or_insert_with(|| SendHandle(
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= candidates.len() {
+                    break;
+                }
+                last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
+                let (pid, handle, _granted) = candidates[idx];
+
+                let proc = {
+                    let mut cache = proc_cache.lock().unwrap();
+                    cache
+                        .entry(pid)
+                        .or_insert_with(|| {
+                            SendHandle(
                                 // 失败缓存必须用 INVALID_HANDLE_VALUE(-1) 作哨兵：
                                 // HANDLE::default() 是 null，is_invalid() 识别不了，
                                 // 会导致"已失败"的 pid 被当成可用来回复制
                                 unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
                                     .unwrap_or(INVALID_HANDLE_VALUE),
-                            ))
-                            .0
-                    };
-                    if proc.is_invalid() {
-                        continue; // 该 pid 打不开（已缓存失败结果）
-                    }
+                            )
+                        })
+                        .0
+                };
+                if proc.is_invalid() {
+                    last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue; // 该 pid 打不开（已缓存失败结果）
+                }
 
-                    let mut dup = HANDLE::default();
-                    // GetCurrentProcess 返回伪句柄，线程内直接调用零开销
-                    let me = unsafe { GetCurrentProcess() };
-                    let ok = unsafe {
-                        DuplicateHandle(
-                            proc,
-                            HANDLE(handle as _),
-                            me,
-                            &mut dup,
-                            0,
-                            false,
-                            DUPLICATE_SAME_ACCESS,
-                        )
-                    }
-                    .is_ok();
-                    if !ok {
-                        continue;
-                    }
+                let mut dup = HANDLE::default();
+                // GetCurrentProcess 返回伪句柄，线程内直接调用零开销
+                let me = unsafe { GetCurrentProcess() };
+                let ok = unsafe {
+                    DuplicateHandle(
+                        proc,
+                        HANDLE(handle as _),
+                        me,
+                        &mut dup,
+                        0,
+                        false,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                }
+                .is_ok();
+                if !ok {
+                    last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
 
-                    // 只解析磁盘文件句柄，跳过命名管道等可能阻塞的对象类型
-                    if unsafe { GetFileType(dup) } == FILE_TYPE_DISK {
-                        // 缓冲按返回值增长（winutil::final_path_from_handle），长路径不漏报
-                        if let Some(resolved) = final_path_from_handle(dup) {
-                            if hit(&resolved) {
-                                results
-                                    .lock()
-                                    .unwrap()
-                                    .entry(pid)
-                                    .or_default()
-                                    .push(resolved);
-                            }
+                // 只解析磁盘文件句柄，跳过命名管道等可能阻塞的对象类型
+                if unsafe { GetFileType(dup) } == FILE_TYPE_DISK {
+                    // 缓冲按返回值增长（winutil::final_path_from_handle），长路径不漏报
+                    if let Some(resolved) = final_path_from_handle(dup) {
+                        if hit(&resolved) {
+                            results
+                                .lock()
+                                .unwrap()
+                                .entry(pid)
+                                .or_default()
+                                .push(resolved);
                         }
                     }
-                    unsafe {
-                        let _ = CloseHandle(dup);
+                }
+                unsafe {
+                    let _ = CloseHandle(dup);
+                }
+
+                last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
+                let processed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(cb) = &progress {
+                    // 每 256 个候选上报一次，最后收尾一次；进度保持单调递增
+                    if processed % 256 == 0 || processed == total_candidates {
+                        cb(processed, total_candidates);
                     }
                 }
-            });
-        }
-    });
+            }
+        }));
+    }
 
-    if let Some(cb) = progress {
+    // Watchdog：某个系统调用（GetFileType/GetFinalPathNameByHandleW）卡死时，
+    // 不让整个后台任务永久挂起。返回错误并放弃等待卡住的线程；
+    // 这些线程持有 Arc，若后续恢复也只会自然退出，不会产生悬垂引用。
+    const WATCHDOG_MS: u64 = 15_000;
+    loop {
+        if handles.iter().all(|h| h.is_finished()) {
+            break;
+        }
+        let now = now_millis();
+        for (worker_id, handle) in handles.iter().enumerate() {
+            if !handle.is_finished()
+                && now.saturating_sub(last_progress[worker_id].load(Ordering::Relaxed))
+                    > WATCHDOG_MS
+            {
+                log::error!(
+                    "[句柄扫描] 候选解析超时（{} 秒无进度，worker {}），中止等待",
+                    WATCHDOG_MS / 1000,
+                    worker_id
+                );
+                return Err(format!(
+                    "句柄解析超时（{} 秒无进度）；扫描可能受系统句柄状态影响",
+                    WATCHDOG_MS / 1000
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if let Some(cb) = &progress {
         cb(total_candidates, total_candidates); // 收尾推满，保证进度条走完
     }
 
     // 释放缓存的进程句柄
-    for SendHandle(proc) in proc_cache.into_inner().unwrap().into_values() {
+    for (_pid, SendHandle(proc)) in proc_cache.lock().unwrap().drain() {
         if !proc.is_invalid() {
             unsafe {
                 let _ = CloseHandle(proc);
@@ -330,7 +398,11 @@ fn collect_handle_paths_if(
         }
     }
 
-    Ok(results.into_inner().unwrap())
+    let map = Arc::try_unwrap(results)
+        .map_err(|_| "扫描结果引用异常".to_string())?
+        .into_inner()
+        .unwrap();
+    Ok(map)
 }
 
 #[cfg(test)]
