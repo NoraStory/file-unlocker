@@ -5,9 +5,9 @@ use tauri::{Emitter, Manager, State};
 
 mod diagnostics;
 mod file_actions;
-mod probe_utils;
 mod handle_scan;
 mod lock_detector;
+mod probe_utils;
 mod updater;
 mod winutil;
 
@@ -155,15 +155,36 @@ fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
     log::info!("[日志] 打开日志目录: {}", dir.display());
 
     use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
     let wide = crate::winutil::to_wide(&dir.to_string_lossy());
     let op = crate::winutil::to_wide("open"); // 先绑定变量，避免临时值悬垂
-    let result = unsafe {
-        ShellExecuteW(None, PCWSTR(op.as_ptr()), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL)
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        // 打开失败时不弹 Shell 重试对话框，避免命令线程被 UI 挂起卡死
+        fMask: SEE_MASK_FLAG_NO_UI,
+        hwnd: windows::Win32::Foundation::HWND::default(),
+        lpVerb: PCWSTR(op.as_ptr()),
+        lpFile: PCWSTR(wide.as_ptr()),
+        lpParameters: PCWSTR::null(),
+        lpDirectory: PCWSTR::null(),
+        nShow: SW_SHOWNORMAL.0,
+        hInstApp: windows::Win32::Foundation::HINSTANCE::default(),
+        lpIDList: std::ptr::null_mut(),
+        lpClass: PCWSTR::null(),
+        hkeyClass: windows::Win32::System::Registry::HKEY::default(),
+        dwHotKey: 0,
+        Anonymous: windows::Win32::UI::Shell::SHELLEXECUTEINFOW_0::default(),
+        hProcess: windows::Win32::Foundation::HANDLE::default(),
     };
-    if (result.0 as isize) <= 32 {
-        return Err(format!("打开日志目录失败（错误码 {}）", result.0 as isize));
+    unsafe { ShellExecuteExW(&mut info) }
+        .map_err(|e| format!("打开日志目录失败：{}", crate::winutil::win32_err(&e)))?;
+    if info.hInstApp.is_invalid() || info.hInstApp.0 as isize <= 32 {
+        return Err(format!(
+            "打开日志目录失败（错误码 {}）",
+            info.hInstApp.0 as isize
+        ));
     }
     Ok(())
 }
@@ -211,7 +232,10 @@ fn export_logs_impl(app: &tauri::AppHandle, dest_dir: &str) -> Result<String, St
         return Err("日志目录中没有可导出的文件（程序可能刚启动尚无日志）".into());
     }
     log::info!("[日志] 已导出 {copied} 个日志文件到 {}", out_dir.display());
-    Ok(format!("已导出 {copied} 个日志文件到：{}", out_dir.display()))
+    Ok(format!(
+        "已导出 {copied} 个日志文件到：{}",
+        out_dir.display()
+    ))
 }
 
 /// 可读时间戳（本地时间 YYYYMMDD-HHMMSS）
@@ -237,9 +261,7 @@ async fn run_diagnostics(app: tauri::AppHandle) -> Vec<diagnostics::DiagItem> {
 /// 检查更新（GitHub → Gitee 依次尝试）。
 /// 网络/解析失败返回 Err（原因向上抛给前端），无更新 Ok(None)，有更新 Ok(Some)
 #[tauri::command]
-async fn check_update(
-    app: tauri::AppHandle,
-) -> Result<Option<updater::UpdateInfo>, String> {
+async fn check_update(app: tauri::AppHandle) -> Result<Option<updater::UpdateInfo>, String> {
     let current = app.package_info().version.to_string();
     log::info!("[更新] 手动检查，当前版本 {current}");
     tauri::async_runtime::spawn_blocking(move || updater::check_for_update(&current))
@@ -323,11 +345,7 @@ pub fn run() {
             let args: Vec<String> = std::env::args().collect();
             if let Some(path) = extract_path_from_args(&args) {
                 log::info!("[启动] 携带文件参数: {path}");
-                app.state::<PendingFile>()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .replace(path);
+                app.state::<PendingFile>().0.lock().unwrap().replace(path);
             }
             // 启动后静默检查更新（非阻塞；HTTP 是阻塞调用，须进 spawn_blocking，
             // 直接放在 async task 里会占住运行时的工作线程）
