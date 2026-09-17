@@ -10,13 +10,13 @@
 把它拖进来，占用它的进程一目了然。
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?logo=windows11&logoColor=white)](#-系统要求)
-[![Release](https://img.shields.io/badge/Release-v0.3.5-2ea44f?logo=github)](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.5)
+[![Release](https://img.shields.io/badge/Release-v0.3.6-2ea44f?logo=github)](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6)
 [![License: MIT](https://img.shields.io/badge/License-MIT-8A2BE2.svg)](LICENSE)
 ![Size](https://img.shields.io/badge/%E4%B8%BB%E7%A8%8B%E5%BA%8F-3.3%20MB-orange)
 
-> ⚠️ **当前仅 v0.3.5 可用。** v0.3.4 及更早版本在句柄扫描阶段可能因系统异常句柄卡死/超时失败，请升级到 [v0.3.5](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.5)。
+> ⚠️ **当前推荐 v0.3.6。** v0.3.4 及更早版本在句柄扫描阶段可能因系统异常句柄卡死/超时失败；v0.3.5 已修复该问题，v0.3.6 进一步修复目录扫描上限提示。建议使用 [v0.3.6](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6)。
 
-**[下载 v0.3.5](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.5)** · [加入右键菜单](#-右键菜单) · [自己构建](#-构建)
+**[下载 v0.3.6](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6)** · [加入右键菜单](#-右键菜单) · [自己构建](#-构建)
 
 </div>
 
@@ -40,7 +40,8 @@
 
 部分新版 Windows（实测 25H2）上 Restart Manager 对第三方进程的查询会异常，此时句柄扫描独立扛下全部工作，**不影响使用**。
 
-> v0.3.5 对个别系统坏句柄加入了 1 秒超时保护：遇到无法解析的句柄会自动跳过并返回已收集结果，不会再导致整体扫描失败。
+> v0.3.5+ 对个别系统坏句柄加入了 1 秒超时保护：遇到无法解析的句柄会自动跳过并返回已收集结果，不会再导致整体扫描失败。
+> v0.3.6 的目录模式按目录前缀完整扫描，不再提示“目录文件过多，仅检测前 2000 个”。
 
 ## 实测环境
 
@@ -54,14 +55,14 @@
 | 主程序体积 | 3.3 MB（单文件免安装） |
 | 安装包体积 | 1.1 MB（NSIS） |
 | 支持系统 | Windows 10 1809+ / 11，x64 |
-| 可用版本 | **仅 v0.3.5**（v0.3.4 及更早存在句柄扫描超时失败问题） |
+| 推荐版本 | **v0.3.6**（v0.3.4 及更早存在句柄扫描超时失败问题） |
 
 > 程序以管理员权限运行（结束系统进程、扫描句柄都需要）。
 > 普通权限下检测和删除个人文件仍可用，仅结束系统进程会被拒绝。
 
 ## 下载使用
 
-到 [v0.3.5 Release](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.5) 页面（当前仅该版本可用）：
+到 [v0.3.6 Release](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6) 页面（当前推荐版本）：
 
 | 文件 | 说明 |
 |---|---|
