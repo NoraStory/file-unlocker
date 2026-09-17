@@ -38,10 +38,6 @@
   let fileNotice = $state<string | null>(null);
   /** 当前目标是文件夹（右键菜单支持文件夹入口） */
   let isDirectory = $state(false);
-  /** 目录扫描达到文件数上限被截断 */
-  let scanTruncated = $state(false);
-  /** 目录模式实际枚举的文件数 */
-  let scanFileCount = $state(0);
   /** 删除确认条展开中（替代原生 confirm，风格统一且不会被误触跳过） */
   let confirmingDelete = $state(false);
 
@@ -80,7 +76,6 @@
     error = null;
     fileNotice = null;
     scanProgress = null;
-    scanTruncated = false;
     confirmingDelete = false;
     scanning = true;
     // 右键菜单/拖拽传入的目录路径不带尾部分隔符，必须问后端真实文件类型；
@@ -92,8 +87,6 @@
       const outcome = await getLockingProcesses(path);
       if (gen !== scanGeneration) return; // 已被更新的扫描取代
       processes = outcome.processes;
-      scanTruncated = outcome.truncated;
-      scanFileCount = outcome.file_count;
       scanned = true;
     } catch (e) {
       if (gen !== scanGeneration) return;
@@ -129,9 +122,7 @@
         // 期间若用户发起了新扫描，刷新结果不得覆盖新扫描
         if (gen === scanGeneration) {
           processes = outcome.processes;
-          scanTruncated = outcome.truncated;
-          scanFileCount = outcome.file_count;
-        }
+                }
       } catch {
         /* 刷新失败保持原列表 */
       }
@@ -168,7 +159,6 @@
     scanned = false;
     error = null;
     fileNotice = null;
-    scanTruncated = false;
     confirmingDelete = false;
   }
 
@@ -601,9 +591,6 @@
             class="rounded-full px-2 py-0.5 text-xs"
             style="background: {processes.length > 0 ? 'var(--danger)' : 'var(--ok)'}33; color: {processes.length > 0 ? 'var(--danger)' : 'var(--ok)'};"
           >{processes.length} 个</span>
-        {/if}
-        {#if scanned && !scanning && scanTruncated}
-          <span class="dim text-[11px]">目录文件过多，仅检测前 {scanFileCount} 个</span>
         {/if}
       </div>
       {#if filePath}

@@ -205,10 +205,12 @@ pub fn get_locking_processes(
     result
 }
 
-/// 文件夹模式：递归枚举目录内文件，检测每个文件的占用者并按 PID 聚合。
+/// 文件夹模式：按目录前缀批量检测内部文件占用，并按 PID 聚合。
 ///
 /// 句柄扫描对"查询目录本身"无效（锁的是内部文件，路径不等），
-/// 所以必须展开到文件粒度。为控制耗时限制最大扫描文件数。
+/// 因此使用目录前缀匹配，一次句柄表遍历即可覆盖所有内部文件。
+/// 递归枚举仅用于统计文件数和检测可读性；为避免超大目录卡 UI，
+/// 最多枚举 2000 个路径，且枚举数量不影响扫描覆盖范围。
 fn scan_directory(
     dir: &Path,
     on_progress: crate::handle_scan::ProgressCallback,
@@ -242,7 +244,6 @@ fn scan_directory(
     }
 
     let total = files.len();
-    let truncated = total >= MAX_FILES;
 
     // 性能关键路径：一次句柄表遍历解析出全部文件句柄路径，
     // 与目录前缀做匹配——等价于逐文件 scan() 但从 O(N×全表) 降为 O(1×全表)。
@@ -283,7 +284,7 @@ fn scan_directory(
             list.sort_by_key(|p| p.pid);
             return Ok(ScanOutcome {
                 processes: list,
-                truncated,
+                truncated: false,
                 file_count: total,
             });
         }
@@ -317,20 +318,13 @@ fn scan_directory(
         }
     }
 
-    if merged.is_empty() && !files.is_empty() {
-        // 句柄扫描正常完成但无命中 = 目录下无锁定文件，这是可信结果
-        return Ok(ScanOutcome {
-            processes: Vec::new(),
-            truncated,
-            file_count: total,
-        });
-    }
-
+    // 目录模式真正依赖句柄扫描：一次遍历即可匹配整个目录前缀，
+    // 文件枚举只用于确认目录可读和统计展示，扫描覆盖并不受 2000 上限截断。
     let mut list: Vec<ProcessInfo> = merged.into_values().collect();
     list.sort_by_key(|p| p.pid);
     Ok(ScanOutcome {
         processes: list,
-        truncated,
+        truncated: false,
         file_count: total,
     })
 }
