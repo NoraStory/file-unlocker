@@ -6,10 +6,10 @@
 use std::{
     path::Path,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
@@ -24,13 +24,6 @@ use crate::winutil::{enable_debug_privilege, final_path_from_handle};
 
 pub type HitPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub type ProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync>;
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// SystemExtendedHandleInformation 的信息类别码
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
@@ -246,147 +239,139 @@ fn collect_handle_paths_if(
         }
         candidate_vec.push((pid, entry.handle, entry.granted_access));
     }
-    let total_candidates = candidate_vec.len();
     let candidates = Arc::new(candidate_vec);
 
-    // 并行解析：进程句柄按 pid 缓存（Mutex），INVALID_HANDLE_VALUE 表示该 pid 打不开
+    // 并行解析：采用 PowerToys 同源的“工作线程 + watchdog”策略。
+    // NtQuerySystemInformation 快照是只读数据；真正可能卡死的是
+    // DuplicateHandle 后的 GetFileType / GetFinalPathNameByHandleW。
+    // 我们为每个候选句柄创建独立 worker，主线程持续监控进度，
+    // 超时后跳过该候选并重建 worker，而不是让一个坏句柄毁掉整次扫描。
     let results: Arc<Mutex<std::collections::HashMap<u32, Vec<String>>>> = Default::default();
     let proc_cache: Arc<Mutex<std::collections::HashMap<u32, SendHandle>>> = Default::default();
-    let next = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicUsize::new(0));
 
-    let workers = std::thread::available_parallelism()
+    const WATCHDOG_MS: u64 = 1000; // PowerToys 用 200ms；这里放宽减少误判
+    const PROGRESS_EVERY: usize = 256;
+
+    let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .min(16);
-    let last_progress: Arc<Vec<AtomicU64>> =
-        Arc::new((0..workers).map(|_| AtomicU64::new(now_millis())).collect());
+    let total = candidates.len();
 
-    let mut handles = Vec::with_capacity(workers);
-    for worker_id in 0..workers {
-        let hit = hit.clone();
-        let progress = progress.clone();
-        let candidates = candidates.clone();
-        let results = results.clone();
-        let proc_cache = proc_cache.clone();
-        let next = next.clone();
-        let done = done.clone();
-        let last_progress = last_progress.clone();
+    std::thread::scope(|scope| {
+        // 多个独立 slot 并行消费；每个 slot 遇到卡死就终止并重建
+        let mut slot_handles = Vec::with_capacity(parallelism);
+        for slot in 0..parallelism {
+            let hit = hit.clone();
+            let progress = progress.clone();
+            let candidates = candidates.clone();
+            let results = results.clone();
+            let proc_cache = proc_cache.clone();
+            let done = done.clone();
+            let counter = Arc::new(AtomicUsize::new(slot));
 
-        handles.push(std::thread::spawn(move || {
-            loop {
-                let idx = next.fetch_add(1, Ordering::Relaxed);
-                if idx >= candidates.len() {
-                    break;
-                }
-                last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
-                let (pid, handle, _granted) = candidates[idx];
+            slot_handles.push(scope.spawn(move || {
+                loop {
+                    let idx = counter.fetch_add(parallelism, Ordering::Relaxed);
+                    if idx >= total {
+                        break;
+                    }
+                    let (pid, handle, _granted) = candidates[idx];
 
-                let proc = {
-                    let mut cache = proc_cache.lock().unwrap();
-                    cache
-                        .entry(pid)
-                        .or_insert_with(|| {
-                            SendHandle(
-                                // 失败缓存必须用 INVALID_HANDLE_VALUE(-1) 作哨兵：
-                                // HANDLE::default() 是 null，is_invalid() 识别不了，
-                                // 会导致"已失败"的 pid 被当成可用来回复制
-                                unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
-                                    .unwrap_or(INVALID_HANDLE_VALUE),
-                            )
+                    // 每个候选在独立线程执行，watchdog 观察进度
+                    let worker = {
+                        let hit = hit.clone();
+                        let results = results.clone();
+                        let proc_cache = proc_cache.clone();
+                        std::thread::spawn(move || {
+                            // OpenProcess/DuplicateHandle 本身通常快速完成；
+                            // 若真的卡死，整个候选 worker 会被 watchdog 跳过。
+                            let proc = {
+                                let mut cache = proc_cache.lock().unwrap();
+                                cache
+                                    .entry(pid)
+                                    .or_insert_with(|| {
+                                        SendHandle(
+                                            unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
+                                                .unwrap_or(INVALID_HANDLE_VALUE),
+                                        )
+                                    })
+                                    .0
+                            };
+                            if proc.is_invalid() {
+                                return;
+                            }
+
+                            let mut dup = HANDLE::default();
+                            let me = unsafe { GetCurrentProcess() };
+                            let ok = unsafe {
+                                DuplicateHandle(
+                                    proc,
+                                    HANDLE(handle as _),
+                                    me,
+                                    &mut dup,
+                                    0,
+                                    false,
+                                    DUPLICATE_SAME_ACCESS,
+                                )
+                            }
+                            .is_ok();
+                            if !ok {
+                                return;
+                            }
+
+                            // 只解析磁盘文件句柄，跳过命名管道等可能阻塞的对象类型
+                            if unsafe { GetFileType(dup) } == FILE_TYPE_DISK {
+                                if let Some(resolved) = final_path_from_handle(dup) {
+                                    if hit(&resolved) {
+                                        results
+                                            .lock()
+                                            .unwrap()
+                                            .entry(pid)
+                                            .or_default()
+                                            .push(resolved);
+                                    }
+                                }
+                            }
+                            unsafe {
+                                let _ = CloseHandle(dup);
+                            }
                         })
-                        .0
-                };
-                if proc.is_invalid() {
-                    last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
-                    done.fetch_add(1, Ordering::Relaxed);
-                    continue; // 该 pid 打不开（已缓存失败结果）
-                }
+                    };
 
-                let mut dup = HANDLE::default();
-                // GetCurrentProcess 返回伪句柄，线程内直接调用零开销
-                let me = unsafe { GetCurrentProcess() };
-                let ok = unsafe {
-                    DuplicateHandle(
-                        proc,
-                        HANDLE(handle as _),
-                        me,
-                        &mut dup,
-                        0,
-                        false,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                }
-                .is_ok();
-                if !ok {
-                    last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
-                    done.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+                    // watchdog：候选级保护。超时则跳过该候选；worker 卡在系统调用时
+                    // 不 join，让内核在其解除阻塞后自然退出并释放资源。
+                    let deadline = Instant::now() + Duration::from_millis(WATCHDOG_MS);
+                    while !worker.is_finished() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if worker.is_finished() {
+                        let _ = worker.join();
+                    } else {
+                        log::warn!(
+                            "[句柄扫描] 候选句柄解析超时（pid={pid}, handle={handle:#x}），已跳过"
+                        );
+                        std::mem::forget(worker);
+                    }
 
-                // 只解析磁盘文件句柄，跳过命名管道等可能阻塞的对象类型
-                if unsafe { GetFileType(dup) } == FILE_TYPE_DISK {
-                    // 缓冲按返回值增长（winutil::final_path_from_handle），长路径不漏报
-                    if let Some(resolved) = final_path_from_handle(dup) {
-                        if hit(&resolved) {
-                            results
-                                .lock()
-                                .unwrap()
-                                .entry(pid)
-                                .or_default()
-                                .push(resolved);
+                    let processed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(cb) = &progress {
+                        if processed % PROGRESS_EVERY == 0 || processed == total {
+                            cb(processed, total);
                         }
                     }
                 }
-                unsafe {
-                    let _ = CloseHandle(dup);
-                }
-
-                last_progress[worker_id].store(now_millis(), Ordering::Relaxed);
-                let processed = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(cb) = &progress {
-                    // 每 256 个候选上报一次，最后收尾一次；进度保持单调递增
-                    if processed % 256 == 0 || processed == total_candidates {
-                        cb(processed, total_candidates);
-                    }
-                }
-            }
-        }));
-    }
-
-    // Watchdog：某个系统调用（GetFileType/GetFinalPathNameByHandleW）卡死时，
-    // 不让整个后台任务永久挂起。返回错误并放弃等待卡住的线程；
-    // 这些线程持有 Arc，若后续恢复也只会自然退出，不会产生悬垂引用。
-    const WATCHDOG_MS: u64 = 15_000;
-    loop {
-        if handles.iter().all(|h| h.is_finished()) {
-            break;
+            }));
         }
-        let now = now_millis();
-        for (worker_id, handle) in handles.iter().enumerate() {
-            if !handle.is_finished()
-                && now.saturating_sub(last_progress[worker_id].load(Ordering::Relaxed))
-                    > WATCHDOG_MS
-            {
-                log::error!(
-                    "[句柄扫描] 候选解析超时（{} 秒无进度，worker {}），中止等待",
-                    WATCHDOG_MS / 1000,
-                    worker_id
-                );
-                return Err(format!(
-                    "句柄解析超时（{} 秒无进度）；扫描可能受系统句柄状态影响",
-                    WATCHDOG_MS / 1000
-                ));
-            }
+
+        for h in slot_handles {
+            let _ = h.join();
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    for handle in handles {
-        let _ = handle.join();
-    }
+    });
 
     if let Some(cb) = &progress {
-        cb(total_candidates, total_candidates); // 收尾推满，保证进度条走完
+        cb(total, total); // 收尾推满，保证进度条走完
     }
 
     // 释放缓存的进程句柄
@@ -398,10 +383,9 @@ fn collect_handle_paths_if(
         }
     }
 
-    let map = Arc::try_unwrap(results)
-        .map_err(|_| "扫描结果引用异常".to_string())?
-        .into_inner()
-        .unwrap();
+    // 忽略被 watchdog 跳过但尚未退出的 worker 持有的引用，
+    // 返回当前已收集到的部分结果。
+    let map = results.lock().unwrap().clone();
     Ok(map)
 }
 
