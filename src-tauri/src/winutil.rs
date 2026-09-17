@@ -5,16 +5,16 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
@@ -32,32 +32,56 @@ pub fn utf16_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
-/// 查询进程可执行文件的完整路径（需要 PROCESS_QUERY_LIMITED_INFORMATION）
-pub fn process_image_full(pid: u32) -> Option<String> {
-    let handle =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+/// 从已打开的进程句柄查询可执行文件完整路径。
+pub fn process_image_from_handle(handle: HANDLE) -> Option<String> {
     // 映像路径可超 MAX_PATH（长路径/\\?\ 形式）：1024 起步，缓冲不足按失败翻倍，上限 32767
     let mut len = 1024usize;
-    let result = loop {
+    loop {
         let mut buf = vec![0u16; len];
         let mut size = buf.len() as u32;
         let r = unsafe {
             QueryFullProcessImageNameW(
-                HANDLE(handle.0),
+                handle,
                 PROCESS_NAME_WIN32,
                 PWSTR(buf.as_mut_ptr()),
                 &mut size,
             )
         };
         if r.is_ok() {
-            break Some(String::from_utf16_lossy(&buf[..size as usize]));
+            return Some(String::from_utf16_lossy(&buf[..size as usize]));
         }
         use windows::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER};
         if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || len >= 32767 {
-            break None;
+            return None;
         }
         len *= 2;
-    };
+    }
+}
+
+/// 查询进程可执行文件的完整路径（需要 PROCESS_QUERY_LIMITED_INFORMATION）
+pub fn process_image_full(pid: u32) -> Option<String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let result = process_image_from_handle(HANDLE(handle.0));
+    unsafe {
+        let _ = CloseHandle(HANDLE(handle.0));
+    }
+    result
+}
+
+/// 读取已打开进程句柄的创建时间，返回 FILETIME 的 100ns 计数。
+pub fn process_creation_time_from_handle(handle: HANDLE) -> Option<u64> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }.ok()?;
+    Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
+/// 查询进程创建时间，用于避免 PID 复用后误操作无关进程。
+pub fn process_creation_time(pid: u32) -> Option<u64> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let result = process_creation_time_from_handle(HANDLE(handle.0));
     unsafe {
         let _ = CloseHandle(HANDLE(handle.0));
     }
@@ -81,6 +105,38 @@ pub fn strip_device_prefix(path: &str) -> String {
     path.to_string()
 }
 
+/// 将路径转换为统一的可比较形式：剥离设备前缀、统一分隔符并转小写。
+pub fn normalize_path_string(path: &str) -> String {
+    strip_device_prefix(path).replace('/', "\\").to_lowercase()
+}
+
+/// 使用 GetLongPathNameW 展开 8.3 短名；失败时保留原路径。
+pub fn long_path_name(path: &str) -> String {
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    let wide = to_wide(path);
+    let mut len = 1024usize;
+    loop {
+        let mut buf = vec![0u16; len];
+        let n = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
+        if n == 0 {
+            return path.to_string();
+        }
+        if n <= buf.len() {
+            return utf16_string(&buf[..n]);
+        }
+        if n > 32767 {
+            return path.to_string();
+        }
+        len = n;
+    }
+}
+
+/// 将目标路径解析到最终形态后，再做大小写不敏感比较。
+pub fn normalize_path_for_compare(path: &str) -> String {
+    let resolved = final_path_of(path).unwrap_or_else(|| long_path_name(path));
+    normalize_path_string(&resolved)
+}
+
 /// 从已打开的句柄取最终路径（跟随 junction/symlink）。
 /// GetFinalPathNameByHandleW 缓冲不足时返回所需长度（含 NUL），
 /// 按返回值增长重试（1024 起步、上限 32767），长路径不漏报。
@@ -90,7 +146,8 @@ pub fn final_path_from_handle(handle: HANDLE) -> Option<String> {
     loop {
         let mut buf = vec![0u16; len];
         // FILE_NAME_NORMALIZED(0) 与 VOLUME_NAME_DOS(0) 都是 0，等价于默认值组合
-        let n = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) } as usize;
+        let n =
+            unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) } as usize;
         if n == 0 {
             return None;
         }
@@ -153,15 +210,8 @@ pub fn file_description(exe_path: &str) -> Option<String> {
     let mut len = 0u32;
     let query = |sub: &str, ptr: &mut *mut std::ffi::c_void, len: &mut u32| -> bool {
         let sub_wide = to_wide(sub);
-        unsafe {
-            VerQueryValueW(
-                data.as_ptr().cast(),
-                PCWSTR(sub_wide.as_ptr()),
-                ptr,
-                len,
-            )
-        }
-        .as_bool()
+        unsafe { VerQueryValueW(data.as_ptr().cast(), PCWSTR(sub_wide.as_ptr()), ptr, len) }
+            .as_bool()
     };
 
     // 注意：VerQueryValueW 的 puLen 单位是字节。
@@ -237,13 +287,7 @@ pub fn enable_debug_privilege() {
         }
         let mut luid = windows::Win32::Foundation::LUID::default();
         let name = to_wide("SeDebugPrivilege");
-        if LookupPrivilegeValueW(
-            PCWSTR::null(),
-            PCWSTR(name.as_ptr()),
-            &mut luid,
-        )
-        .is_err()
-        {
+        if LookupPrivilegeValueW(PCWSTR::null(), PCWSTR(name.as_ptr()), &mut luid).is_err() {
             let _ = CloseHandle(token);
             return;
         }
@@ -262,7 +306,8 @@ pub fn enable_debug_privilege() {
 }
 
 #[cfg(test)]
-mod tests {    use super::*;
+mod tests {
+    use super::*;
 
     #[test]
     fn to_wide_appends_nul_terminator() {
@@ -298,8 +343,37 @@ mod tests {    use super::*;
     #[test]
     fn strip_device_prefix_handles_local_and_unc() {
         assert_eq!(strip_device_prefix(r"\\?\C:\Windows"), r"C:\Windows");
-        assert_eq!(strip_device_prefix(r"\\?\UNC\server\share"), r"\\server\share");
-        assert_eq!(strip_device_prefix(r"\\?\unc\server\share"), r"\\server\share");
+        assert_eq!(
+            strip_device_prefix(r"\\?\UNC\server\share"),
+            r"\\server\share"
+        );
+        assert_eq!(
+            strip_device_prefix(r"\\?\unc\server\share"),
+            r"\\server\share"
+        );
         assert_eq!(strip_device_prefix(r"C:\plain"), r"C:\plain");
+    }
+
+    #[test]
+    fn normalize_path_string_handles_slashes_and_prefixes() {
+        assert_eq!(
+            normalize_path_string(r"\\?\C:/Windows/System32"),
+            r"c:\windows\system32"
+        );
+        assert_eq!(
+            normalize_path_string(r"\\?\UNC\NAS\Docs/F.txt"),
+            r"\\nas\docs\f.txt"
+        );
+    }
+
+    #[test]
+    fn process_creation_time_is_available_for_self() {
+        let creation = process_creation_time(std::process::id()).expect("self creation time");
+        assert!(creation > 0);
+    }
+
+    #[test]
+    fn process_creation_time_rejects_zero_pid() {
+        assert_eq!(process_creation_time(0), None);
     }
 }

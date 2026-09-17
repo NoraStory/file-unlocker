@@ -5,9 +5,7 @@
 use std::path::Path;
 
 use windows::core::PCWSTR;
-use windows::Win32::Storage::FileSystem::{
-    DeleteFileW, MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT,
-};
+use windows::Win32::Storage::FileSystem::{DeleteFileW, MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
 
 use crate::winutil::{to_wide, win32_err};
 
@@ -43,36 +41,18 @@ fn resolved_for_check(path: &str) -> String {
             match p.strip_prefix(dir) {
                 Ok(rel) => {
                     let rel = rel.to_string_lossy().replace('/', "\\");
-                    return if rel.is_empty() { base } else { format!("{base}\\{rel}") };
+                    return if rel.is_empty() {
+                        base
+                    } else {
+                        format!("{base}\\{rel}")
+                    };
                 }
                 Err(_) => break,
             }
         }
         ancestor = dir.parent();
     }
-    long_path_name(path)
-}
-
-/// GetLongPathNameW 展开 8.3 短名（不跟随 junction/symlink 的最后兜底）；
-/// 展开失败退回原路径，前缀匹配仍然兜底
-fn long_path_name(path: &str) -> String {
-    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
-    let wide = to_wide(path);
-    let mut len = 1024usize;
-    loop {
-        let mut buf = vec![0u16; len];
-        let n = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
-        if n == 0 {
-            return path.to_string();
-        }
-        if n <= buf.len() {
-            return crate::winutil::utf16_string(&buf[..n]);
-        }
-        if n > 32767 {
-            return path.to_string();
-        }
-        len = n;
-    }
+    crate::winutil::long_path_name(path)
 }
 
 /// 判断路径是否为系统关键位置——这些位置禁止删除，防止误操作损坏系统。
@@ -124,7 +104,7 @@ pub fn delete_file(path: &str) -> Result<(), String> {
     unsafe { DeleteFileW(PCWSTR(wide.as_ptr())) }.map_err(|e| {
         let msg = win32_err(&e);
         if msg.contains("被另一进程使用") {
-            format!("删除失败：文件仍被占用；可先结束全部占用进程，或改用\"重启后删除\"")
+            "删除失败：文件仍被占用；可先结束全部占用进程，或改用\"重启后删除\"".to_string()
         } else {
             format!("删除失败：{msg}")
         }

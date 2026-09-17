@@ -17,7 +17,7 @@ static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn create_probe(dir: &Path, prefix: &str) -> io::Result<(PathBuf, File)> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .map_err(io::Error::other)?
         .as_nanos() as u64;
 
     for attempt in 0..8u64 {
@@ -49,30 +49,6 @@ pub(crate) fn create_probe(dir: &Path, prefix: &str) -> io::Result<(PathBuf, Fil
         io::ErrorKind::AlreadyExists,
         "探针文件路径生成失败（连续冲突）",
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn probe_paths_are_unique_and_cleaned() {
-        let dir = std::env::temp_dir();
-        let probe1 = ProbeFile::create(&dir, "fu_probe_test").unwrap();
-        let probe2 = ProbeFile::create(&dir, "fu_probe_test").unwrap();
-
-        assert_ne!(probe1.path(), probe2.path());
-        assert!(probe1.path().exists());
-        assert!(probe2.path().exists());
-
-        let path1 = probe1.path().to_path_buf();
-        let path2 = probe2.path().to_path_buf();
-        drop(probe1);
-        drop(probe2);
-
-        assert!(!path1.exists());
-        assert!(!path2.exists());
-    }
 }
 
 /// 探针文件 RAII：Drop 时先释放句柄再删除文件，
@@ -115,5 +91,29 @@ impl std::ops::Deref for ProbeFile {
 impl std::ops::DerefMut for ProbeFile {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.file.as_mut().expect("probe file is alive")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_paths_are_unique_and_cleaned() {
+        let dir = std::env::temp_dir();
+        let probe1 = ProbeFile::create(&dir, "fu_probe_test").unwrap();
+        let probe2 = ProbeFile::create(&dir, "fu_probe_test").unwrap();
+
+        assert_ne!(probe1.path(), probe2.path());
+        assert!(probe1.path().exists());
+        assert!(probe2.path().exists());
+
+        let path1 = probe1.path().to_path_buf();
+        let path2 = probe2.path().to_path_buf();
+        drop(probe1);
+        drop(probe2);
+
+        assert!(!path1.exists());
+        assert!(!path2.exists());
     }
 }

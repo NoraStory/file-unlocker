@@ -35,14 +35,15 @@ fn fail(name: &str, detail: impl Into<String>) -> DiagItem {
 
 /// 执行全部自检项
 pub fn run_diagnostics(app: &tauri::AppHandle) -> Vec<DiagItem> {
-    let mut items = Vec::new();
-    items.push(check_admin());
-    items.push(check_debug_privilege());
-    items.push(check_restart_manager());
-    items.push(check_handle_scan());
-    items.push(check_context_menu());
-    items.push(check_log_writable(app));
-    items.push(check_os_version());
+    let items = vec![
+        check_admin(),
+        check_debug_privilege(),
+        check_restart_manager(),
+        check_handle_scan(),
+        check_context_menu(),
+        check_log_writable(app),
+        check_os_version(),
+    ];
     for item in &items {
         log::info!("[自检] {}: {} — {}", item.name, item.status, item.detail);
     }

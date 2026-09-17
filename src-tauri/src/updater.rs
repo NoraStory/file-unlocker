@@ -98,7 +98,10 @@ pub fn check_for_update(current: &str) -> Result<Option<UpdateInfo>, String> {
                 source: source.to_string(),
             }));
         }
-        log::info!("[更新] 源 {source} 版本 {} 不新于当前 {current}", manifest.version);
+        log::info!(
+            "[更新] 源 {source} 版本 {} 不新于当前 {current}",
+            manifest.version
+        );
         return Ok(None); // 源可达且清单有效：以它为准，不再试下一个
     }
     Err(if last_err.is_empty() {
@@ -184,13 +187,16 @@ pub fn download_asset(
     let mut done: u64 = 0;
     loop {
         use std::io::Read;
-        let n = reader.read(&mut buf).map_err(|e| format!("下载中断：{e}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("下载中断：{e}"))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
         use std::io::Write;
-        file.write_all(&buf[..n]).map_err(|e| format!("写入失败：{e}"))?;
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("写入失败：{e}"))?;
         done += n as u64;
         on_progress(done, total);
     }
@@ -206,7 +212,10 @@ pub fn download_asset(
             asset.sha256
         ));
     }
-    log::info!("[更新] 下载完成并通过校验: {} ({done} 字节)", dest.display());
+    log::info!(
+        "[更新] 下载完成并通过校验: {} ({done} 字节)",
+        dest.display()
+    );
     Ok(dest)
 }
 
@@ -250,7 +259,10 @@ pub fn launch_installer(path: &std::path::Path) -> Result<(), String> {
     };
     // ShellExecuteW 返回 HINSTANCE；<= 32 为错误码
     if (result.0 as isize) <= 32 {
-        return Err(format!("启动安装程序失败（ShellExecute 错误码 {}）", result.0 as isize));
+        return Err(format!(
+            "启动安装程序失败（ShellExecute 错误码 {}）",
+            result.0 as isize
+        ));
     }
     // 给安装器一点启动时间（NSIS 会自行弹出 UAC 确认），随后退出本进程
     std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -311,12 +323,19 @@ mod tests {
         assert!(validate_asset_name("").is_err());
         // Windows 保留设备名（不区分大小写、不含扩展名部分）
         for bad in [
-            "CON", "con.txt", "NUL.exe", "PRN.dat", "AUX", "com1.exe", "COM9.bin", "lpt1", "LPT9.dll",
+            "CON", "con.txt", "NUL.exe", "PRN.dat", "AUX", "com1.exe", "COM9.bin", "lpt1",
+            "LPT9.dll",
         ] {
             assert!(validate_asset_name(bad).is_err(), "应拒绝 {bad}");
         }
         // 非保留名不受影响（COM0/COM10 不在 COM1-9 保留区间）
-        for good in ["com0.exe", "com10.exe", "lpt0.dat", "common.txt", "console.zip"] {
+        for good in [
+            "com0.exe",
+            "com10.exe",
+            "lpt0.dat",
+            "common.txt",
+            "console.zip",
+        ] {
             assert!(validate_asset_name(good).is_ok(), "应接受 {good}");
         }
     }

@@ -102,16 +102,20 @@
     }
   }
 
-  async function kill(pid: number, tree: boolean) {
+  async function kill(process: ProcessInfo, tree: boolean) {
     if (busy || !filePath) return;
-    killingPid = pid;
+    killingPid = process.pid;
     error = null;
     const gen = scanGeneration;
     try {
       if (tree) {
-        await killProcessTree(pid);
+        await killProcessTree(
+          process.pid,
+          process.creation_time,
+          process.exe_path,
+        );
       } else {
-        await killProcess(pid);
+        await killProcess(process.pid, process.creation_time, process.exe_path);
       }
       await scan(filePath);
     } catch (e) {
@@ -280,12 +284,18 @@
     appVersion = await getAppVersion();
   }
 
+  /** 消费后端最新 pending 路径；事件和 mount 兜底共用同一入口。 */
+  async function consumePendingFile(allowReplace = true) {
+    const pending = await takePendingFile();
+    if (pending && (allowReplace || !filePath)) await scan(pending);
+  }
+
   onMount(() => {
     (async () => {
       // 右键菜单 / 二次启动传入的新文件路径
       unlisteners.push(
-        await listen<string>("new-file", (e) => {
-          if (e.payload) scan(e.payload);
+        await listen<string>("new-file", () => {
+          void consumePendingFile(true);
         }),
       );
 
@@ -334,9 +344,8 @@
         }),
       );
 
-      // 启动参数中带路径（右键菜单首次启动）时立即检测
-      const pending = await takePendingFile();
-      if (pending && !filePath) scan(pending);
+      // 启动参数或已丢失事件中的 pending 路径在此兜底消费
+      await consumePendingFile(false);
 
       // 启动静默检查的 emit 可能早于 WebView 就绪而丢失，取落地副本兜底
       const pendingUpdate = await takePendingUpdate();
@@ -692,12 +701,12 @@
                 style="background: var(--stroke);"
                 disabled={busy}
                 title="结束该进程及其全部子进程"
-                onclick={() => kill(p.pid, true)}
+                onclick={() => kill(p, true)}
               >结束树</button>
               <button
                 class="danger-btn shrink-0 px-3 py-1.5 text-xs font-medium disabled:opacity-50"
                 disabled={busy}
-                onclick={() => kill(p.pid, false)}
+                onclick={() => kill(p, false)}
               >
                 {#if killingPid === p.pid}
                   <svg class="spin inline-block align-[-2px]" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
