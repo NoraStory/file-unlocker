@@ -13,6 +13,7 @@ use std::os::windows::fs::OpenOptionsExt;
 
 #[path = "../src/handle_scan.rs"]
 mod handle_scan;
+#[allow(dead_code)]
 #[path = "../src/lock_detector.rs"]
 mod lock_detector;
 #[path = "../src/winutil.rs"]

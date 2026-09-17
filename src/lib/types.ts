@@ -1,6 +1,8 @@
 /** 后端 `ProcessInfo` 结构体的前端镜像 */
 export interface ProcessInfo {
   pid: number;
+  /** 进程创建时间（FILETIME 100ns 计数，使用字符串避免 JS 精度丢失） */
+  creation_time: string;
   /** 进程可执行文件名，如 WINWORD.EXE */
   process_name: string;
   /** 进程可执行文件完整路径（查询失败时为空） */

@@ -20,7 +20,10 @@ use windows::Win32::Foundation::{
 use windows::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
 
-use crate::winutil::{enable_debug_privilege, final_path_from_handle};
+use crate::winutil::{
+    enable_debug_privilege, final_path_from_handle, normalize_path_for_compare,
+    normalize_path_string,
+};
 
 pub type HitPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub type ProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync>;
@@ -150,8 +153,9 @@ pub fn bench_scan(path: &std::path::Path) -> Vec<u32> {
 /// 扫描引擎本身失效（快照查询失败等）返回 Err，与"无占用"的空结果
 /// 明确区分——上层不得把失效伪装成"文件未被占用"。
 pub fn scan(path: &Path) -> Result<Vec<u32>, String> {
-    let target = normalize_path(path);
-    let hit: HitPredicate = Arc::new(move |resolved: &str| resolved.to_lowercase() == target);
+    let target = normalize_path_for_compare(&path.to_string_lossy());
+    let hit: HitPredicate =
+        Arc::new(move |resolved: &str| normalize_path_string(resolved) == target);
     let map = collect_handle_paths_if(hit, None)?;
     Ok(map.into_keys().collect())
 }
@@ -167,21 +171,13 @@ pub fn scan_directory(
     dir: &Path,
     on_progress: ProgressCallback,
 ) -> Result<std::collections::HashMap<u32, Vec<String>>, String> {
-    let mut prefix = normalize_path(dir);
+    let mut prefix = normalize_path_for_compare(&dir.to_string_lossy());
     if !prefix.ends_with('\\') {
         prefix.push('\\');
     }
     let hit: HitPredicate =
-        Arc::new(move |resolved: &str| resolved.to_lowercase().starts_with(&prefix));
+        Arc::new(move |resolved: &str| normalize_path_string(resolved).starts_with(&prefix));
     collect_handle_paths_if(hit, Some(on_progress))
-}
-
-/// 归一化：剥离 `\\?\` 设备前缀（UNC 还原为 `\\server\share`）后小写。
-/// GetFinalPathNameByHandleW 对 UNC 返回 `\\?\UNC\server\share\...`，
-/// 若只剥前缀会得到 `unc\server\share`，与前端传入的 `\\server\share`
-/// 永不相等——网络共享文件会恒漏报。
-fn normalize_path(path: &Path) -> String {
-    crate::winutil::strip_device_prefix(&path.to_string_lossy()).to_lowercase()
 }
 
 /// 跨线程传递的进程句柄包装：HANDLE 仅按数值语义使用，
@@ -394,31 +390,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_strips_device_prefix() {
-        assert_eq!(
-            normalize_path(std::path::Path::new(r"\\?\C:\Data\F.TXT")),
-            r"c:\data\f.txt"
+    fn normalize_target_resolves_forward_slashes_and_dot_segments() {
+        let dir = std::env::temp_dir().join("fu_normalize_probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"probe").unwrap();
+        let forward = file.to_string_lossy().replace('\\', "/");
+        let dotted = format!(
+            "{}/../fu_normalize_probe/f.txt",
+            dir.to_string_lossy().replace('\\', "/")
         );
+
+        let expected = normalize_path_for_compare(&file.to_string_lossy());
+        assert_eq!(normalize_path_for_compare(&forward), expected);
+        assert_eq!(normalize_path_for_compare(&dotted), expected);
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
-    fn normalize_restores_unc_prefix() {
-        // GetFinalPathNameByHandleW 对 UNC 返回 \\?\UNC\server\share，
-        // 必须还原为 \\server\share，否则网络共享文件恒漏报
+    fn normalize_resolved_path_is_case_and_separator_insensitive() {
         assert_eq!(
-            normalize_path(std::path::Path::new(r"\\?\UNC\NAS\Docs\f.txt")),
-            r"\\nas\docs\f.txt"
-        );
-    }
-
-    #[test]
-    fn normalize_keeps_plain_unc_and_local() {
-        assert_eq!(
-            normalize_path(std::path::Path::new(r"\\NAS\Docs\f.txt")),
-            r"\\nas\docs\f.txt"
-        );
-        assert_eq!(
-            normalize_path(std::path::Path::new(r"C:\Data\f.txt")),
+            normalize_path_string(r"\\?\C:/Data/F.TXT"),
             r"c:\data\f.txt"
         );
     }

@@ -44,25 +44,53 @@ export async function getLockingProcesses(
   }
 }
 
-/** 强制结束指定 PID 的进程 */
-export async function killProcess(pid: number): Promise<void> {
+function validateProcessIdentity(
+  pid: number,
+  creationTime: string,
+  exePath: string,
+): void {
   if (!Number.isInteger(pid) || pid <= 0) {
     throw new Error(`无效的进程 ID：${pid}`);
   }
+  if (!creationTime || !/^\d+$/.test(creationTime)) {
+    throw new Error("进程创建时间无效，请重新检测后再操作");
+  }
+  if (!exePath.trim()) {
+    throw new Error("进程路径为空，请重新检测后再操作");
+  }
+}
+
+/** 强制结束指定 PID 的进程 */
+export async function killProcess(
+  pid: number,
+  creationTime: string,
+  exePath: string,
+): Promise<void> {
+  validateProcessIdentity(pid, creationTime, exePath);
   try {
-    await invoke<void>("kill_process", { pid });
+    await invoke<void>("kill_process", {
+      pid,
+      creationTime,
+      exePath,
+    });
   } catch (e) {
     throw new Error(toErrorMessage(e));
   }
 }
 
 /** 结束整个进程树（含全部子进程） */
-export async function killProcessTree(pid: number): Promise<void> {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    throw new Error(`无效的进程 ID：${pid}`);
-  }
+export async function killProcessTree(
+  pid: number,
+  creationTime: string,
+  exePath: string,
+): Promise<void> {
+  validateProcessIdentity(pid, creationTime, exePath);
   try {
-    await invoke<void>("kill_process_tree", { pid });
+    await invoke<void>("kill_process_tree", {
+      pid,
+      creationTime,
+      exePath,
+    });
   } catch (e) {
     throw new Error(toErrorMessage(e));
   }

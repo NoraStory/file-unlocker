@@ -29,21 +29,26 @@ fn extract_path_from_args(args: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// 保存最新待处理路径。真正的消费由前端 `take_pending_file` 完成，
+/// 因为 `emit` 成功不代表 WebView 已注册监听器。
+fn set_pending_file(state: &PendingFile, path: String) {
+    state.0.lock().unwrap().replace(path);
+}
+
+/// 一次性取走 pending 文件路径。
+fn take_pending_file_impl(state: &PendingFile) -> Option<String> {
+    state.0.lock().unwrap().take()
+}
+
 /// 推送新文件路径给主窗口（焦点 + 事件；窗口未就绪时仅落地 pending state）
 fn push_file(app: &tauri::AppHandle, path: String) {
     let state = app.state::<PendingFile>();
-    state.0.lock().unwrap().replace(path.clone());
+    set_pending_file(&state, path.clone());
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_focus();
-        // 事件送达后清掉 pending：窗口已存在时 pending 多余，残留到下次
-        // mount 会被 take_pending_file 重复取走，旧文件再次被推给前端。
-        // 仅当 pending 仍是本次路径时才清，避免误清并发推入的更新路径
-        if window.emit("new-file", path.clone()).is_ok() {
-            let mut pending = state.0.lock().unwrap();
-            if pending.as_deref() == Some(path.as_str()) {
-                pending.take();
-            }
-        }
+        // 这里不清 pending：Tauri 的 emit 在没有 JS 监听器时也可能返回 Ok。
+        // 前端收到事件后会调用 take_pending_file，未收到则 mount 时兜底消费。
+        let _ = window.emit("new-file", path);
     }
 }
 
@@ -70,19 +75,27 @@ async fn get_locking_processes(
 }
 
 #[tauri::command]
-async fn kill_process(pid: u32) -> Result<(), String> {
+async fn kill_process(pid: u32, creation_time: String, exe_path: String) -> Result<(), String> {
     // kill 后要等待最长 3 秒确认退出，必须在后台线程
-    tauri::async_runtime::spawn_blocking(move || lock_detector::kill_process(pid))
-        .await
-        .map_err(|e| format!("后台任务异常：{e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        lock_detector::kill_process(pid, creation_time, exe_path)
+    })
+    .await
+    .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
 /// 结束整个进程树（含全部子进程）
 #[tauri::command]
-async fn kill_process_tree(pid: u32) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || lock_detector::kill_process_tree(pid))
-        .await
-        .map_err(|e| format!("后台任务异常：{e}"))?
+async fn kill_process_tree(
+    pid: u32,
+    creation_time: String,
+    exe_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        lock_detector::kill_process_tree(pid, creation_time, exe_path)
+    })
+    .await
+    .map_err(|e| format!("后台任务异常：{e}"))?
 }
 
 /// 立即删除文件（delete=true 双重确认，防止误触；路径/系统目录校验在后端执行）
@@ -116,7 +129,7 @@ fn is_directory(path: String) -> bool {
 
 #[tauri::command]
 fn take_pending_file(state: State<'_, PendingFile>) -> Option<String> {
-    state.0.lock().unwrap().take()
+    take_pending_file_impl(&state)
 }
 
 /// 取走启动静默检查发现的更新信息（一次性；与 take_pending_file 同理）
@@ -342,7 +355,7 @@ pub fn run() {
             let args: Vec<String> = std::env::args().collect();
             if let Some(path) = extract_path_from_args(&args) {
                 log::info!("[启动] 携带文件参数: {path}");
-                app.state::<PendingFile>().0.lock().unwrap().replace(path);
+                set_pending_file(&app.state::<PendingFile>(), path);
             }
             // 启动后静默检查更新（非阻塞；HTTP 是阻塞调用，须进 spawn_blocking，
             // 直接放在 async task 里会占住运行时的工作线程）
@@ -374,4 +387,43 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_file_take_is_one_shot() {
+        let state = PendingFile(Mutex::new(None));
+        set_pending_file(&state, "C:\\first.txt".into());
+        assert_eq!(
+            take_pending_file_impl(&state).as_deref(),
+            Some("C:\\first.txt")
+        );
+        assert_eq!(take_pending_file_impl(&state), None);
+    }
+
+    #[test]
+    fn pending_file_keeps_latest_path() {
+        let state = PendingFile(Mutex::new(None));
+        set_pending_file(&state, "C:\\first.txt".into());
+        set_pending_file(&state, "C:\\second.txt".into());
+        assert_eq!(
+            take_pending_file_impl(&state).as_deref(),
+            Some("C:\\second.txt")
+        );
+    }
+
+    #[test]
+    fn register_script_forwards_absolute_argument_on_uac() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("register-context-menu.bat");
+        let bytes = std::fs::read(path).expect("read register script");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("-ArgumentList @('%~f1')"));
+        assert!(text.contains("set \"EXE=%~f1\""));
+    }
 }
