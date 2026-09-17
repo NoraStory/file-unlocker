@@ -1,18 +1,18 @@
 {
-  "version": "0.3.3",
-  "notes": "FileUnlocker 0.3.3 更新",
+  "version": "0.3.4",
+  "notes": "修复自检探针残留与句柄扫描超时保护",
   "assets": [
     {
-      "name": "FileUnlocker_0.3.3_x64-setup.exe",
+      "name": "FileUnlocker_0.3.4_x64-setup.exe",
       "kind": "installer",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.3/FileUnlocker_0.3.3_x64-setup.exe",
-      "sha256": "4e8a383ee8c1cd249d3dfbdab47dcd7a5c17a5586a16453067f86e0030cd41d8"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.4/FileUnlocker_0.3.4_x64-setup.exe",
+      "sha256": "4290cd350d5647e2dcd83bf8c12031c97f8ece74574e886d40361e127c79cd9d"
     },
     {
       "name": "file-unlocker.exe",
       "kind": "portable",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.3/file-unlocker.exe",
-      "sha256": "8b3b95543590f3f224de2203485cbec438f6bad305327bd0852f7b9cc74a78a7"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.4/file-unlocker.exe",
+      "sha256": "f10ec4d4d9b56ac15f7f721cdbc486e6b5832293ad262ec0dbd72e6ccfb2585b"
     }
   ]
 }
