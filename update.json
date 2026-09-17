@@ -1,18 +1,18 @@
 {
-  "version": "0.3.6",
-  "notes": "目录扫描覆盖完整文件，不再提示 2000 上限",
+  "version": "0.3.7",
+  "notes": "加固进程终止身份校验与路径匹配，补充安全防护与测试",
   "assets": [
     {
-      "name": "FileUnlocker_0.3.6_x64-setup.exe",
+      "name": "FileUnlocker_0.3.7_x64-setup.exe",
       "kind": "installer",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.6/FileUnlocker_0.3.6_x64-setup.exe",
-      "sha256": "fa62ab2ec36afd656e59fefe1638b3fbe40c1376aea0da52f115ad82e3fe1c39"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.7/FileUnlocker_0.3.7_x64-setup.exe",
+      "sha256": "05779690de5dd54b40fb46d07d98a6d4098e1198464612d473222c84ba47dd01"
     },
     {
       "name": "file-unlocker.exe",
       "kind": "portable",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.6/file-unlocker.exe",
-      "sha256": "3e4e97eaad71e9f53290f7ab82922bb25b338afa3bb95f831f3e1bfac7b9766e"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.7/file-unlocker.exe",
+      "sha256": "c108bbf7fb445d178b1c311cfb8f914e54405d509583bd289e7ac2e2799528a7"
     }
   ]
 }

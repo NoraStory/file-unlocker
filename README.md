@@ -10,13 +10,13 @@
 把它拖进来，占用它的进程一目了然。
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?logo=windows11&logoColor=white)](#-系统要求)
-[![Release](https://img.shields.io/badge/Release-v0.3.6-2ea44f?logo=github)](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6)
+[![Release](https://img.shields.io/badge/Release-v0.3.7-2ea44f?logo=github)](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.7)
 [![License: MIT](https://img.shields.io/badge/License-MIT-8A2BE2.svg)](LICENSE)
 ![Size](https://img.shields.io/badge/%E4%B8%BB%E7%A8%8B%E5%BA%8F-3.3%20MB-orange)
 
-> ⚠️ **当前推荐 v0.3.6。** v0.3.4 及更早版本在句柄扫描阶段可能因系统异常句柄卡死/超时失败；v0.3.5 已修复该问题，v0.3.6 进一步修复目录扫描上限提示。建议使用 [v0.3.6](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6)。
+> ⚠️ **当前推荐 v0.3.7。** v0.3.4 及更早版本在句柄扫描阶段可能因系统异常句柄卡死/超时失败；v0.3.5 已修复该问题，v0.3.6 进一步修复目录扫描上限提示，v0.3.7 加固进程终止身份校验与路径匹配。建议使用 [v0.3.7](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.7)。
 
-**[下载 v0.3.6](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6)** · [加入右键菜单](#-右键菜单) · [自己构建](#-构建)
+**[下载 v0.3.7](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.7)** · [加入右键菜单](#-右键菜单) · [自己构建](#-构建)
 
 </div>
 
@@ -32,6 +32,8 @@
 - 文件被锁死删不掉？可以**删除**，或者**计划下次重启时由系统删除**（那时锁早没了）
 
 ## 检测原理
+
+**v0.3.7 安全加固**：结束进程前会核对进程创建时间与可执行文件路径，避免 PID 复用后误杀无关进程；句柄扫描路径统一处理正斜杠、`.`、`..`、大小写与设备前缀。
 
 两条独立的路，结果合并去重：
 
@@ -55,14 +57,14 @@
 | 主程序体积 | 3.3 MB（单文件免安装） |
 | 安装包体积 | 1.1 MB（NSIS） |
 | 支持系统 | Windows 10 1809+ / 11，x64 |
-| 推荐版本 | **v0.3.6**（v0.3.4 及更早存在句柄扫描超时失败问题） |
+| 推荐版本 | **v0.3.7**（v0.3.4 及更早存在句柄扫描超时失败问题） |
 
 > 程序以管理员权限运行（结束系统进程、扫描句柄都需要）。
 > 普通权限下检测和删除个人文件仍可用，仅结束系统进程会被拒绝。
 
 ## 下载使用
 
-到 [v0.3.6 Release](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.6) 页面（当前推荐版本）：
+到 [v0.3.7 Release](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.7) 页面（当前推荐版本）：
 
 | 文件 | 说明 |
 |---|---|
@@ -119,6 +121,7 @@ scripts/                      右键菜单注册脚本、图标生成
 ## 须知
 
 - 结束进程不可撤销，点之前看清是哪个程序
+- 程序会核对 PID 创建时间和可执行文件路径，避免 PID 复用后误杀无关进程
 - 少数受系统保护的进程（如 `csrss.exe`）Windows 会拒绝终止，这是系统设计，不是 bug
 - "重启后删除"写入 `PendingFileRenameOperations`，由内核在下次启动早期执行，别对系统文件用
 - 句柄扫描是只读的，不干扰目标进程；没权限的进程自动跳过
