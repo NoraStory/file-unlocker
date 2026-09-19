@@ -294,6 +294,20 @@ mod tests {
     }
 
     #[test]
+    fn version_compare_edge_cases() {
+        // 多段与超长段：数值比较而非字典序
+        assert!(is_newer("1.0.0.1", "1.0.0"));
+        assert!(is_newer("0.3.10", "0.3.9")); // 字典序会误判 9 > 10
+        assert!(!is_newer("0.3.9", "0.3.10"));
+        // 非数字段被忽略："0.3.7-beta" 与 "0.3.7" 相等
+        assert!(!is_newer("0.3.7-beta", "0.3.7"));
+        assert!(!is_newer("0.3.7", "0.3.7-beta.2"));
+        // 纯非数字候选（解析为空）不视为新版本
+        assert!(!is_newer("v", "0.3.7"));
+        assert!(!is_newer("release", "0.3.7"));
+    }
+
+    #[test]
     fn empty_current_accepts_any() {
         assert!(is_newer("0.1.0", ""));
         assert!(!is_newer("", "0.1.0"));
