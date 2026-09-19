@@ -1,0 +1,66 @@
+# CI 护栏：Windows runner 上运行 Rust 测试 / clippy / 前端检查。
+# 对应架构计划 Phase 0：先护栏后动刀——所有后续重构必须在此绿灯下进行。
+name: CI
+
+on:
+  push:
+    branches: [main, Fix]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # 只缓存增量所需，避免 target 目录无限膨胀
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rust:
+    name: Rust (test + clippy)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-windows-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-windows-
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --lib -- -D warnings
+
+  frontend:
+    name: Frontend (svelte-check + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check (svelte-check)
+        run: npm run check
+
+      - name: Build (vite)
+        run: npm run build

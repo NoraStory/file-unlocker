@@ -367,6 +367,37 @@ mod tests {
     }
 
     #[test]
+    fn normalize_path_string_edge_cases() {
+        // 空串：安全返回空，不 panic
+        assert_eq!(normalize_path_string(""), "");
+        // 混合分隔符与大小写归一
+        assert_eq!(
+            normalize_path_string("D:/Data/Report.PDF"),
+            r"d:\data\report.pdf"
+        );
+        // 比较语义：仅大小写/分隔符差异的路径归一后相等
+        assert_eq!(
+            normalize_path_string(r"C:\Windows\explorer.exe"),
+            normalize_path_string("c:/windows/EXPLORER.EXE")
+        );
+        // 非设备前缀的双反斜杠 UNC 路径保持原样（仅归一化大小写与分隔符）
+        assert_eq!(
+            normalize_path_string(r"\\Server\Share\File"),
+            r"\\server\share\file"
+        );
+    }
+
+    #[test]
+    fn strip_device_prefix_keeps_relative_paths() {
+        // 相对路径与盘符根：原样返回，不做任何改写
+        assert_eq!(strip_device_prefix("relative\\path.txt"), "relative\\path.txt");
+        assert_eq!(strip_device_prefix(r"C:\"), r"C:\");
+        // 仅前缀本身：剥离后为空串
+        assert_eq!(strip_device_prefix(r"\\?\"), "");
+        assert_eq!(strip_device_prefix(r"\\?\UNC\"), r"\\");
+    }
+
+    #[test]
     fn process_creation_time_is_available_for_self() {
         let creation = process_creation_time(std::process::id()).expect("self creation time");
         assert!(creation > 0);

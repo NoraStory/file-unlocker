@@ -1,18 +1,18 @@
 {
-  "version": "0.3.6",
-  "notes": "目录扫描覆盖完整文件，不再提示 2000 上限",
+  "version": "0.3.8",
+  "notes": "架构重构：结构化错误码 + 前后端模块化拆分，新增 CI 测试护栏（52 个单元测试）。功能行为与 0.3.7 完全一致。",
   "assets": [
     {
-      "name": "FileUnlocker_0.3.6_x64-setup.exe",
+      "name": "FileUnlocker_0.3.8_x64-setup.exe",
       "kind": "installer",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.6/FileUnlocker_0.3.6_x64-setup.exe",
-      "sha256": "fa62ab2ec36afd656e59fefe1638b3fbe40c1376aea0da52f115ad82e3fe1c39"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.8/FileUnlocker_0.3.8_x64-setup.exe",
+      "sha256": "1c7f745c7a90a065ead59692d16a581bd1fb54fec3fa373c94539390d53a6dfd"
     },
     {
       "name": "file-unlocker.exe",
       "kind": "portable",
-      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.6/file-unlocker.exe",
-      "sha256": "3e4e97eaad71e9f53290f7ab82922bb25b338afa3bb95f831f3e1bfac7b9766e"
+      "url": "https://github.com/NoraStory/file-unlocker/releases/download/v0.3.8/file-unlocker.exe",
+      "sha256": "5899497da181d583b3d9dece73ffe55c0956024ab523276d711ebafe82979f30"
     }
   ]
 }

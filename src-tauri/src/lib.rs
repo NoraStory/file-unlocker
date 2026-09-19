@@ -1,301 +1,30 @@
-use std::sync::{Arc, Mutex};
+//! 库入口：模块装配与 Tauri 应用启动。
+//!
+//! 分层结构（Phase 1 热点切割后）：
+//! - `commands/`：Tauri IPC 命令层（参数转发 + spawn_blocking 调度）
+//! - `core/`：业务编排（扫描合并、进程终止）
+//! - `engines/`：检测引擎（Restart Manager；句柄扫描见 `handle_scan`）
+//! - `state.rs`：共享状态（pending 文件/更新）
+//! - 平台 FFI 细节收敛在 `winutil`/`handle_scan`/`probe_utils`
 
-use lock_detector::ScanOutcome;
-use tauri::{Emitter, Manager, State};
-
+mod commands;
+mod core;
 mod diagnostics;
+mod engines;
+mod error;
 mod file_actions;
 mod handle_scan;
 mod lock_detector;
 mod probe_utils;
+mod state;
 mod updater;
 mod winutil;
 
-/// 启动参数中携带、等待前端取走的文件路径。
-///
-/// 存在的意义：单实例回调或提权启动时，主窗口可能尚未创建，
-/// 直接 emit 事件会丢失，所以先落地到 state，由前端挂载后主动取走。
-struct PendingFile(Mutex<Option<String>>);
+use std::sync::Mutex;
 
-/// 启动静默检查发现的更新信息，同样落地等前端取走——
-/// WebView 未加载完成时 emit 的 "update-available" 事件会丢失。
-struct PendingUpdate(Mutex<Option<updater::UpdateInfo>>);
+use tauri::{Emitter, Manager};
 
-/// 从命令行参数中找出第一个真实存在的文件/目录路径
-fn extract_path_from_args(args: &[String]) -> Option<String> {
-    args.iter()
-        .skip(1) // 跳过 argv[0]（程序自身路径）
-        .find(|a| std::path::Path::new(a).exists())
-        .cloned()
-}
-
-/// 保存最新待处理路径。真正的消费由前端 `take_pending_file` 完成，
-/// 因为 `emit` 成功不代表 WebView 已注册监听器。
-fn set_pending_file(state: &PendingFile, path: String) {
-    state.0.lock().unwrap().replace(path);
-}
-
-/// 一次性取走 pending 文件路径。
-fn take_pending_file_impl(state: &PendingFile) -> Option<String> {
-    state.0.lock().unwrap().take()
-}
-
-/// 推送新文件路径给主窗口（焦点 + 事件；窗口未就绪时仅落地 pending state）
-fn push_file(app: &tauri::AppHandle, path: String) {
-    let state = app.state::<PendingFile>();
-    set_pending_file(&state, path.clone());
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_focus();
-        // 这里不清 pending：Tauri 的 emit 在没有 JS 监听器时也可能返回 Ok。
-        // 前端收到事件后会调用 take_pending_file，未收到则 mount 时兜底消费。
-        let _ = window.emit("new-file", path);
-    }
-}
-
-/// 重活类命令一律 async + spawn_blocking：
-/// Tauri 的同步 command 在 WebView2 UI 线程内联执行，耗时超过约 200ms
-/// 就会饿死事件循环，Windows 判定"程序未响应"。
-#[tauri::command]
-async fn get_locking_processes(
-    window: tauri::Window<tauri::Wry>,
-    file_path: String,
-) -> Result<ScanOutcome, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        // 目录模式可能扫描数千文件、耗时数秒，向前端发进度事件；
-        // 节流：按已完成的 2% 或每 20 个发一次
-        let window = Arc::new(window);
-        let on_progress: crate::handle_scan::ProgressCallback =
-            Arc::new(move |done: usize, total: usize| {
-                let _ = window.emit("scan-progress", (done, total));
-            });
-        lock_detector::get_locking_processes(&file_path, on_progress)
-    })
-    .await
-    .map_err(|e| format!("后台任务异常：{e}"))?
-}
-
-#[tauri::command]
-async fn kill_process(pid: u32, creation_time: String, exe_path: String) -> Result<(), String> {
-    // kill 后要等待最长 3 秒确认退出，必须在后台线程
-    tauri::async_runtime::spawn_blocking(move || {
-        lock_detector::kill_process(pid, creation_time, exe_path)
-    })
-    .await
-    .map_err(|e| format!("后台任务异常：{e}"))?
-}
-
-/// 结束整个进程树（含全部子进程）
-#[tauri::command]
-async fn kill_process_tree(
-    pid: u32,
-    creation_time: String,
-    exe_path: String,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        lock_detector::kill_process_tree(pid, creation_time, exe_path)
-    })
-    .await
-    .map_err(|e| format!("后台任务异常：{e}"))?
-}
-
-/// 立即删除文件（delete=true 双重确认，防止误触；路径/系统目录校验在后端执行）
-#[tauri::command]
-async fn delete_file(file_path: String, delete: bool) -> Result<(), String> {
-    if !delete {
-        return Err("缺少确认参数".into());
-    }
-    // 删除大文件或网络盘文件可能耗时，遵守"重活一律 spawn_blocking"的约定
-    tauri::async_runtime::spawn_blocking(move || file_actions::delete_file(&file_path))
-        .await
-        .map_err(|e| format!("后台任务异常：{e}"))?
-}
-
-/// 计划下次重启时删除文件（delete=true 双重确认，防止误触）
-#[tauri::command]
-async fn delete_file_on_reboot(file_path: String, delete: bool) -> Result<(), String> {
-    if !delete {
-        return Err("缺少确认参数".into());
-    }
-    tauri::async_runtime::spawn_blocking(move || file_actions::delete_on_reboot(&file_path))
-        .await
-        .map_err(|e| format!("后台任务异常：{e}"))?
-}
-
-/// 判断目标是否为目录（前端据此切换"目录模式"UI，隐藏文件删除按钮）
-#[tauri::command]
-fn is_directory(path: String) -> bool {
-    std::path::Path::new(&path).is_dir()
-}
-
-#[tauri::command]
-fn take_pending_file(state: State<'_, PendingFile>) -> Option<String> {
-    take_pending_file_impl(&state)
-}
-
-/// 取走启动静默检查发现的更新信息（一次性；与 take_pending_file 同理）
-#[tauri::command]
-fn take_pending_update(state: State<'_, PendingUpdate>) -> Option<updater::UpdateInfo> {
-    state.0.lock().unwrap().take()
-}
-
-/// 当前版本号
-#[tauri::command]
-fn app_version(app: tauri::AppHandle) -> String {
-    app.package_info().version.to_string()
-}
-
-/// 日志目录路径
-#[tauri::command]
-fn get_log_dir(app: tauri::AppHandle) -> Result<String, String> {
-    use tauri::Manager;
-    app.path()
-        .app_log_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| format!("获取日志目录失败：{e}"))
-}
-
-/// 打开日志目录（资源管理器）
-#[tauri::command]
-fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::Manager;
-    let dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|e| format!("获取日志目录失败：{e}"))?;
-    log::info!("[日志] 打开日志目录: {}", dir.display());
-
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW};
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    let wide = crate::winutil::to_wide(&dir.to_string_lossy());
-    let op = crate::winutil::to_wide("open"); // 先绑定变量，避免临时值悬垂
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        // 打开失败时不弹 Shell 重试对话框，避免命令线程被 UI 挂起卡死
-        fMask: SEE_MASK_FLAG_NO_UI,
-        hwnd: windows::Win32::Foundation::HWND::default(),
-        lpVerb: PCWSTR(op.as_ptr()),
-        lpFile: PCWSTR(wide.as_ptr()),
-        lpParameters: PCWSTR::null(),
-        lpDirectory: PCWSTR::null(),
-        nShow: SW_SHOWNORMAL.0,
-        hInstApp: windows::Win32::Foundation::HINSTANCE::default(),
-        lpIDList: std::ptr::null_mut(),
-        lpClass: PCWSTR::null(),
-        hkeyClass: windows::Win32::System::Registry::HKEY::default(),
-        dwHotKey: 0,
-        Anonymous: windows::Win32::UI::Shell::SHELLEXECUTEINFOW_0::default(),
-        hProcess: windows::Win32::Foundation::HANDLE::default(),
-    };
-    unsafe { ShellExecuteExW(&mut info) }
-        .map_err(|e| format!("打开日志目录失败：{}", crate::winutil::win32_err(&e)))?;
-    if info.hInstApp.is_invalid() || info.hInstApp.0 as isize <= 32 {
-        return Err(format!(
-            "打开日志目录失败（错误码 {}）",
-            info.hInstApp.0 as isize
-        ));
-    }
-    Ok(())
-}
-
-/// 导出日志：把日志目录全部文件复制到用户选择的目录下
-#[tauri::command]
-async fn export_logs(app: tauri::AppHandle, dest_dir: String) -> Result<String, String> {
-    // 日志可能多达 10×1MB，文件复制移出 UI 线程
-    tauri::async_runtime::spawn_blocking(move || export_logs_impl(&app, &dest_dir))
-        .await
-        .map_err(|e| format!("后台任务异常：{e}"))?
-}
-
-fn export_logs_impl(app: &tauri::AppHandle, dest_dir: &str) -> Result<String, String> {
-    use tauri::Manager;
-    let log_dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|e| format!("获取日志目录失败：{e}"))?;
-    let dest = std::path::Path::new(dest_dir);
-    if !dest.is_dir() {
-        return Err("导出目标不是目录".into());
-    }
-
-    let stamp = chrono_lite_stamp();
-    let out_dir = dest.join(format!("FileUnlocker-logs-{stamp}"));
-    std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建导出目录失败：{e}"))?;
-
-    let mut copied = 0usize;
-    if let Ok(entries) = std::fs::read_dir(&log_dir) {
-        for entry in entries.flatten() {
-            let from = entry.path();
-            if !from.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let to = out_dir.join(&name);
-            if std::fs::copy(&from, &to).is_ok() {
-                copied += 1;
-            }
-        }
-    }
-    if copied == 0 {
-        let _ = std::fs::remove_dir_all(&out_dir);
-        return Err("日志目录中没有可导出的文件（程序可能刚启动尚无日志）".into());
-    }
-    log::info!("[日志] 已导出 {copied} 个日志文件到 {}", out_dir.display());
-    Ok(format!(
-        "已导出 {copied} 个日志文件到：{}",
-        out_dir.display()
-    ))
-}
-
-/// 可读时间戳（本地时间 YYYYMMDD-HHMMSS）
-fn chrono_lite_stamp() -> String {
-    use windows::Win32::Foundation::SYSTEMTIME;
-    use windows::Win32::System::SystemInformation::GetLocalTime;
-    let st: SYSTEMTIME = unsafe { GetLocalTime() };
-    format!(
-        "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
-    )
-}
-
-/// 自检：检测权限、检测引擎、右键菜单、日志等必要前提
-#[tauri::command]
-async fn run_diagnostics(app: tauri::AppHandle) -> Vec<diagnostics::DiagItem> {
-    log::info!("[自检] 开始");
-    tauri::async_runtime::spawn_blocking(move || diagnostics::run_diagnostics(&app))
-        .await
-        .unwrap_or_default()
-}
-
-/// 检查更新（GitHub → Gitee 依次尝试）。
-/// 网络/解析失败返回 Err（原因向上抛给前端），无更新 Ok(None)，有更新 Ok(Some)
-#[tauri::command]
-async fn check_update(app: tauri::AppHandle) -> Result<Option<updater::UpdateInfo>, String> {
-    let current = app.package_info().version.to_string();
-    log::info!("[更新] 手动检查，当前版本 {current}");
-    tauri::async_runtime::spawn_blocking(move || updater::check_for_update(&current))
-        .await
-        .map_err(|e| format!("后台任务异常：{e}"))?
-}
-
-/// 下载更新安装包（SHA256 校验后启动安装器）
-#[tauri::command]
-async fn download_update(
-    window: tauri::Window<tauri::Wry>,
-    asset: updater::UpdateAsset,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let on_progress = |done: u64, total: u64| {
-            let _ = window.emit("update-progress", (done, total));
-        };
-        let path = updater::download_asset(&asset, &on_progress)?;
-        log::info!("[更新] 安装包已就绪: {}", path.display());
-        updater::launch_installer(&path)
-    })
-    .await
-    .map_err(|e| format!("后台任务异常：{e}"))?
-}
+use state::{extract_path_from_args, push_file, set_pending_file, PendingFile, PendingUpdate};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -329,21 +58,21 @@ pub fn run() {
         .manage(PendingFile(Mutex::new(None)))
         .manage(PendingUpdate(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
-            get_locking_processes,
-            kill_process,
-            kill_process_tree,
-            delete_file,
-            delete_file_on_reboot,
-            is_directory,
-            take_pending_file,
-            take_pending_update,
-            app_version,
-            get_log_dir,
-            open_log_dir,
-            export_logs,
-            run_diagnostics,
-            check_update,
-            download_update
+            commands::scan::get_locking_processes,
+            commands::process::kill_process,
+            commands::process::kill_process_tree,
+            commands::file::delete_file,
+            commands::file::delete_file_on_reboot,
+            commands::scan::is_directory,
+            commands::system::take_pending_file,
+            commands::update::take_pending_update,
+            commands::system::app_version,
+            commands::system::get_log_dir,
+            commands::system::open_log_dir,
+            commands::system::export_logs,
+            commands::system::run_diagnostics,
+            commands::update::check_update,
+            commands::update::download_update
         ])
         .setup(|app| {
             log::info!(
@@ -391,30 +120,6 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn pending_file_take_is_one_shot() {
-        let state = PendingFile(Mutex::new(None));
-        set_pending_file(&state, "C:\\first.txt".into());
-        assert_eq!(
-            take_pending_file_impl(&state).as_deref(),
-            Some("C:\\first.txt")
-        );
-        assert_eq!(take_pending_file_impl(&state), None);
-    }
-
-    #[test]
-    fn pending_file_keeps_latest_path() {
-        let state = PendingFile(Mutex::new(None));
-        set_pending_file(&state, "C:\\first.txt".into());
-        set_pending_file(&state, "C:\\second.txt".into());
-        assert_eq!(
-            take_pending_file_impl(&state).as_deref(),
-            Some("C:\\second.txt")
-        );
-    }
-
     #[test]
     fn register_script_forwards_absolute_argument_on_uac() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
