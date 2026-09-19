@@ -7,20 +7,27 @@ use std::path::Path;
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{DeleteFileW, MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
 
-use crate::winutil::{to_wide, win32_err};
+use crate::error::{AppError, ErrorCode};
+use crate::winutil::{to_wide, win32_code, win32_err};
 
 /// 统一的路径校验：非空、绝对路径、真实存在（重启删除允许不存在，
 /// 因为用户可能计划删除一个已被移动/重命名的路径，故单独放宽）。
-fn validate_path(path: &str, must_exist: bool) -> Result<(), String> {
+fn validate_path(path: &str, must_exist: bool) -> Result<(), AppError> {
     if path.trim().is_empty() {
-        return Err("文件路径为空".into());
+        return Err(AppError::new(ErrorCode::EPathInvalid, "文件路径为空"));
     }
     let p = Path::new(path);
     if !p.is_absolute() {
-        return Err(format!("需要绝对路径，收到：{path}"));
+        return Err(AppError::new(
+            ErrorCode::EPathInvalid,
+            format!("需要绝对路径，收到：{path}"),
+        ));
     }
     if must_exist && !p.exists() {
-        return Err(format!("文件不存在：{path}"));
+        return Err(AppError::new(
+            ErrorCode::EPathNotFound,
+            format!("文件不存在：{path}"),
+        ));
     }
     Ok(())
 }
@@ -94,29 +101,42 @@ fn is_protected_location(path: &str) -> bool {
 }
 
 /// 立即删除文件。占用未释放或权限不足时返回可读错误。
-pub fn delete_file(path: &str) -> Result<(), String> {
+pub fn delete_file(path: &str) -> Result<(), AppError> {
     validate_path(path, true)?;
     if is_protected_location(path) {
-        return Err(format!("拒绝删除：{path} 位于系统受保护目录"));
+        return Err(AppError::new(
+            ErrorCode::EProtected,
+            format!("拒绝删除：{path} 位于系统受保护目录"),
+        ));
     }
 
     let wide = to_wide(path);
     unsafe { DeleteFileW(PCWSTR(wide.as_ptr())) }.map_err(|e| {
         let msg = win32_err(&e);
-        if msg.contains("被另一进程使用") {
+        let code = match win32_code(&e) {
+            2 | 3 => ErrorCode::EPathNotFound,   // 找不到文件 / 路径
+            32 => ErrorCode::EFileBusy,          // 被另一进程使用
+            5 => ErrorCode::EPermDenied,         // 拒绝访问
+            _ => ErrorCode::EUnknown,
+        };
+        let text = if code == ErrorCode::EFileBusy {
             "删除失败：文件仍被占用；可先结束全部占用进程，或改用\"重启后删除\"".to_string()
         } else {
             format!("删除失败：{msg}")
-        }
+        };
+        AppError::new(code, text)
     })
 }
 
 /// 计划在下次系统重启时删除文件（对被锁定的文件同样有效，
 /// 因为删除动作由内核会话管理器在启动早期执行，早于绝大多数进程启动）。
-pub fn delete_on_reboot(path: &str) -> Result<(), String> {
+pub fn delete_on_reboot(path: &str) -> Result<(), AppError> {
     validate_path(path, false)?;
     if is_protected_location(path) {
-        return Err(format!("拒绝计划删除：{path} 位于系统受保护目录"));
+        return Err(AppError::new(
+            ErrorCode::EProtected,
+            format!("拒绝计划删除：{path} 位于系统受保护目录"),
+        ));
     }
 
     let wide = to_wide(path);
@@ -129,7 +149,14 @@ pub fn delete_on_reboot(path: &str) -> Result<(), String> {
             MOVEFILE_DELAY_UNTIL_REBOOT,
         )
     }
-    .map_err(|e| format!("计划重启删除失败：{}", win32_err(&e)))
+    .map_err(|e| {
+        let msg = win32_err(&e);
+        let code = match win32_code(&e) {
+            5 => ErrorCode::EPermDenied, // 拒绝访问（需要管理员）
+            _ => ErrorCode::EUnknown,
+        };
+        AppError::new(code, format!("计划重启删除失败：{msg}"))
+    })
 }
 
 #[cfg(test)]
@@ -158,7 +185,8 @@ mod tests {
         // 保护规则的错误应是"受保护"而非"不存在"——注意 must_exist 校验
         // 先行，因此用确实存在的系统文件断言错误类型
         let err = delete_file("C:\\Windows\\explorer.exe").unwrap_err();
-        assert!(err.contains("受保护"), "unexpected: {err}");
+        assert!(err.message.contains("受保护"), "unexpected: {err}");
+        assert_eq!(err.code, "e_protected");
     }
 
     #[test]
@@ -172,7 +200,7 @@ mod tests {
             return;
         }
         let err = delete_on_reboot("C:\\Progra~1\\fu-bypass-probe.dll").unwrap_err();
-        assert!(err.contains("受保护"), "unexpected: {err}");
+        assert!(err.message.contains("受保护"), "unexpected: {err}");
     }
 
     #[test]
@@ -191,15 +219,32 @@ mod tests {
         let probe = link.join("fu-junction-probe.dll");
         let err = delete_on_reboot(&probe.to_string_lossy()).unwrap_err();
         let _ = std::fs::remove_dir(&link); // 删 junction 本身，不影响目标
-        assert!(err.contains("受保护"), "unexpected: {err}");
+        assert!(err.message.contains("受保护"), "unexpected: {err}");
     }
 
     #[test]
     fn allows_user_files() {
         // 不存在的用户目录文件：路径校验通过，实际删除时才报"不存在"
         let err = delete_file("C:\\Users\\NonExistent\\a.txt").unwrap_err();
-        assert!(err.contains("不存在"), "unexpected: {err}");
-        assert!(!err.contains("受保护"));
+        assert!(err.message.contains("不存在"), "unexpected: {err}");
+        assert!(!err.message.contains("受保护"));
+        // DeleteFileW 返回错误码 2（找不到文件）→ 结构化为 e_path_not_found
+        assert_eq!(err.code, "e_path_not_found");
+    }
+
+    #[test]
+    fn error_codes_are_typed() {
+        // 结构化错误码：前端可按 code 分支（ADR-002 核心验收点）
+        assert_eq!(delete_file("").unwrap_err().code, "e_path_invalid");
+        assert_eq!(delete_file("foo.txt").unwrap_err().code, "e_path_invalid");
+        assert_eq!(
+            delete_file("C:\\Users\\NonExistent\\a.txt")
+                .unwrap_err()
+                .code,
+            "e_path_not_found"
+        );
+        let reboot_err = delete_on_reboot("C:\\Windows\\explorer.exe").unwrap_err();
+        assert_eq!(reboot_err.code, "e_protected");
     }
 
     #[test]
