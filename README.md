@@ -12,7 +12,7 @@
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?logo=windows11&logoColor=white)](#-系统要求)
 [![Release](https://img.shields.io/badge/Release-v0.3.8-2ea44f?logo=github)](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.8)
 [![License: MIT](https://img.shields.io/badge/License-MIT-8A2BE2.svg)](LICENSE)
-![Size](https://img.shields.io/badge/%E4%B8%BB%E7%A8%8B%E5%BA%8F-3.3%20MB-orange)
+![Size](https://img.shields.io/badge/%E4%B8%BB%E7%A8%8B%E5%BA%8F-4.7%20MB-orange)
 [![CI](https://github.com/NoraStory/file-unlocker/actions/workflows/ci.yml/badge.svg)](https://github.com/NoraStory/file-unlocker/actions/workflows/ci.yml)
 
 > ⚠️ **当前推荐 v0.3.8。** v0.3.4 及更早版本在句柄扫描阶段可能因系统异常句柄卡死/超时失败；v0.3.5 已修复该问题，v0.3.6 进一步修复目录扫描上限提示，v0.3.7 加固进程终止身份校验与路径匹配，v0.3.8 完成架构重构（结构化错误码 + 模块化拆分）并新增 CI 测试护栏，功能行为与 v0.3.7 保持一致。建议使用 [v0.3.8](https://github.com/NoraStory/file-unlocker/releases/tag/v0.3.8)。
@@ -36,6 +36,8 @@
 
 **v0.3.7 安全加固**：结束进程前会核对进程创建时间与可执行文件路径，避免 PID 复用后误杀无关进程；句柄扫描路径统一处理正斜杠、`.`、`..`、大小写与设备前缀。
 
+**v0.3.8 架构升级**：IPC 错误升级为结构化错误码（`{code, message}`，如 `e_file_busy` / `e_perm_denied`），界面可按占用、权限、系统保护等类型给出针对性提示；前后端完成模块化拆分，核心合并/终止逻辑全部纳入单元测试（52 个）。
+
 两条独立的路，结果合并去重：
 
 1. **Restart Manager** —— 资源管理器判断"文件正在使用"用的同一套机制，结果权威，还附带应用显示名
@@ -55,8 +57,8 @@
 | 操作系统 | Windows 11 家庭中文版 26200（25H2） |
 | CPU | AMD Ryzen 7 8845H |
 | 内存 | 16 GB |
-| 主程序体积 | 3.3 MB（单文件免安装） |
-| 安装包体积 | 1.1 MB（NSIS） |
+| 主程序体积 | 4.7 MB（单文件免安装） |
+| 安装包体积 | 1.7 MB（NSIS） |
 | 支持系统 | Windows 10 1809+ / 11，x64 |
 | 推荐版本 | **v0.3.8**（v0.3.4 及更早存在句柄扫描超时失败问题） |
 
@@ -69,7 +71,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `FileUnlocker_x.y.z_x64-setup.exe` | 安装版，装完自动创建开始菜单项 |
+| `FileUnlocker_0.3.8_x64-setup.exe` | 安装版，装完自动创建开始菜单项 |
 | `file-unlocker.exe` | 免安装单文件，下载即用 |
 
 使用方式三选一：**拖文件进窗口** · **点窗口选文件** · **右键菜单**（见下节）
@@ -136,6 +138,7 @@ scripts/                      右键菜单注册脚本、图标生成
 - 少数受系统保护的进程（如 `csrss.exe`）Windows 会拒绝终止，这是系统设计，不是 bug
 - "重启后删除"写入 `PendingFileRenameOperations`，由内核在下次启动早期执行，别对系统文件用
 - 句柄扫描是只读的，不干扰目标进程；没权限的进程自动跳过
+- 操作失败时的提示带有错误类型（文件被占用 / 权限不足 / 系统保护路径等），按提示处理即可
 
 ## License
 
